@@ -148,7 +148,9 @@ struct obc_raw {
 /* ------------------------------------------------------------------ planing */
 
 /* Tight row width and row count per plane for each OBS video format. OBS's
- * 4:2:0 formats are both half-height chroma; I420 has three planes, NV12 two. */
+ * 4:2:0 formats are both half-height chroma; I420 has three planes, NV12 two.
+ * P010 is the same two-plane 4:2:0 layout at 16 bits per sample: the 10 bits sit
+ * left-justified in a full 16-bit word, so every row is twice as wide as NV12's. */
 static bool obc_geometry(uint32_t format,
 			 uint32_t width,
 			 uint32_t height,
@@ -181,6 +183,17 @@ static bool obc_geometry(uint32_t format,
 		rows[1] = ch;
 		row_bytes[0] = width;
 		row_bytes[1] = width; /* interleaved UV */
+		return true;
+	case VIDEO_FORMAT_P010:
+		/* Same geometry as NV12 with 16-bit samples: the interleaved UV row is
+		 * (width / 2) U/V pairs of 2 bytes each, i.e. width * 2. */
+		*n_planes = 2;
+		planes[0] = 0;
+		planes[1] = 1;
+		rows[0] = height;
+		rows[1] = ch;
+		row_bytes[0] = width * 2;
+		row_bytes[1] = width * 2;
 		return true;
 	case VIDEO_FORMAT_YUY2:
 		*n_planes = 1;
@@ -369,8 +382,11 @@ static bool obc_start(void *data)
 	uint32_t n_planes = 0;
 	if (!obc_geometry(ovi.output_format, ovi.output_width, ovi.output_height,
 			  (uint32_t[OBC_MAX_PLANES]){0}, rows, row_bytes, &n_planes)) {
-		blog(LOG_ERROR, "[obc-raw] unsupported output format %u",
-		     (unsigned)ovi.output_format);
+		/* libobs already names every video_format for us; never hand-roll a
+		 * table here. */
+		blog(LOG_ERROR, "[obc-raw] unsupported output format %u (%s)",
+		     (unsigned)ovi.output_format,
+		     get_video_format_name(ovi.output_format));
 		obs_data_release(settings);
 		return false;
 	}
