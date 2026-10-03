@@ -23,7 +23,7 @@ All integers little-endian. Structures are plain `uint32`/`uint64`, so there is 
 stream header (once, on connect)   15 × u32 = 60 bytes
   magic 'OBCR' | version | width | height | fps_num | fps_den
   obs_format (enum video_format) | planes
-  linesize[3] (as OBS delivered) | plane_bytes[3] (tight) | reserved
+  linesize[3] | plane_bytes[3] (tight) | reserved
 
 frame header (per frame)           16 bytes
   timestamp (u64, ns) | payload_bytes (u32) | planes (u32)
@@ -33,8 +33,12 @@ frame payload
 ```
 
 Planes go out tight so the receiver's layout depends only on `width`/`height`/`format`, never on OBS's
-internal line stride. If a frame's stride disagrees with the announced geometry the plugin drops that
-frame rather than desyncing the receiver.
+internal line stride — the plugin repacks row by row whenever OBS's stride is wider than the row, and logs
+the first frame's stride so that copy is visible.
+
+`linesize` is sent as **zero**: it is not known until the first frame arrives, while this header goes out at
+connect time. It is kept only so the layout can grow into it. **Receivers must ignore it and use
+`plane_bytes` alone.**
 
 OBS `video_format` values are the enum's declaration order: `I420=1`, `NV12=2`, `YUY2=4`, `UYVY=5`, `BGRA=7`.
 
@@ -82,9 +86,10 @@ Requires the libobs dev headers (`libobs` + `obs-frontend-api` pkg-config). Pres
           payload=3110400 bytes/frame (~1493.0 Mbit/s) to 127.0.0.1:9300
 ```
 
-`3110400` bytes is exactly 1920×1080×1.5 — raw NV12. A 12 s window yielded **720 frames / 2.24 GB**, and
-decoding a frame produced a correct image (right colours, geometry, no stride artefacts). Frame 0 was blank
-because capture started before the scene rendered — expected, not a bug.
+`3110400` bytes is exactly 1920×1080×1.5 — raw NV12. A 30 s capture yielded **1800 frames / 5.6 GB at a
+sustained 60.03 fps** with **zero frame loss** (1800 frames over a 29.98 s span), and decoding a frame
+produced a correct image (right colours, geometry, no stride artefacts). Frame 0 was blank because capture
+started before the scene rendered — expected, not a bug.
 
 ## Gotchas found by running it for real
 

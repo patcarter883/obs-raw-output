@@ -19,8 +19,13 @@
  *   stream header (once, on connect)
  *     u32 magic 'OBCR' | u32 version | u32 width | u32 height
  *     u32 fps_num | u32 fps_den | u32 obs_format(enum video_format)
- *     u32 planes | u32 linesize[3](as delivered) | u32 plane_bytes[3](tight)
+ *     u32 planes | u32 linesize[3] | u32 plane_bytes[3](tight)
  *     u32 reserved
+ *
+ * `linesize` is sent as zero and the receiver must ignore it: it is not known
+ * until the first frame arrives, while this header goes out at connect. It is
+ * kept only so the field layout can grow into it. The receiver relies solely on
+ * `plane_bytes`, which describe the tight layout actually written.
  *   frame header (per frame)
  *     u64 timestamp | u32 payload_bytes | u32 planes
  *   frame payload
@@ -90,7 +95,7 @@ struct obc_raw {
 	uint32_t fps_den;
 	uint32_t format;
 	uint32_t planes;
-	uint32_t linesize[OBC_MAX_PLANES];  /* as OBS delivered on the first frame */
+	uint32_t linesize[OBC_MAX_PLANES]; /* 0 in the header; see above */
 	uint32_t plane_bytes[OBC_MAX_PLANES]; /* tight sizes we put on the wire */
 	uint32_t row_bytes[OBC_MAX_PLANES];
 	uint32_t rows[OBC_MAX_PLANES];
@@ -100,7 +105,7 @@ struct obc_raw {
 	uint64_t frames_dropped;
 	uint64_t bytes_sent;
 	uint32_t consecutive_failures;
-	bool geometry_warned;
+	bool logged_stride;
 
 	pthread_mutex_t lock;
 };
@@ -380,7 +385,7 @@ static bool obc_start(void *data)
 	ctx->frames_dropped = 0;
 	ctx->bytes_sent = 0;
 	ctx->consecutive_failures = 0;
-	ctx->geometry_warned = false;
+	ctx->logged_stride = false;
 
 	struct obc_stream_header hdr;
 	memset(&hdr, 0, sizeof(hdr));
@@ -456,16 +461,17 @@ static void obc_raw_video(void *data, struct video_data *frame)
 		return;
 	}
 
-	/* Reject a frame whose delivery stride disagrees with what the receiver
-	 * was told at connect: a silent mismatch would corrupt every frame from
-	 * here on, so drop instead and say so once. */
+	/* Planes are repacked to the tight layout announced at connect, so OBS's
+	 * delivery stride never reaches the wire. Report it once per session
+	 * anyway: a stride wider than the row is what triggers the per-row copy,
+	 * and this is the only place that becomes visible. */
 	bool ok = true;
-	if (!ctx->geometry_warned) {
-		for (uint32_t i = 0; i < ctx->planes && i < OBC_MAX_PLANES; i++) {
-			uint32_t ls = frame->linesize[i];
-			if (ls != 0 && ls != ctx->row_bytes[i])
-				ctx->linesize[i] = ls; /* recorded, informational */
-		}
+	if (!ctx->logged_stride) {
+		ctx->logged_stride = true;
+		blog(LOG_INFO,
+		     "[obc-raw] first frame: OBS linesize=[%u,%u,%u], tight row bytes=[%u,%u,%u]",
+		     frame->linesize[0], frame->linesize[1], frame->linesize[2],
+		     ctx->row_bytes[0], ctx->row_bytes[1], ctx->row_bytes[2]);
 	}
 
 	struct obc_frame_header fh;
