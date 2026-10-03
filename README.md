@@ -57,9 +57,11 @@ Audio travels on the **same connection** as the video, multiplexed by the frame 
 was chosen over a second port deliberately: the streams stay ordered and paced against each other, where two
 independent sockets can diverge under load and leave the receiver reconciling buffers.
 
-Audio is **planar float32** — OBS's native layout, one plane per channel — so neither side pays for an
-interleaving copy. `audio_rate == 0` in the header means the source has no audio and no audio kinds appear;
-otherwise `audio_channels` and `audio_rate` describe every chunk.
+Audio is **planar float32** — OBS's native layout, one plane per channel — so the plugin needs no interleaving
+copy. A consumer must not hand that layout to GStreamer's `audioconvert` from an `appsrc`, though: without a
+`GstAudioMeta` the buffer is refused with "The stream is in the wrong format", so the encoder repacks each chunk
+to interleaved on the way in (see `tools/appsrc_audio_probe.c`). `audio_rate == 0` in the header means the source
+has no audio and no audio kinds appear; otherwise `audio_channels` and `audio_rate` describe every chunk.
 
 **Sync is carried entirely by the timestamps.** OBS stamps video and audio from the same clock and the plugin
 forwards those timestamps untouched; re-stamping on either side is what would actually break A/V sync.
@@ -113,6 +115,27 @@ Requires the libobs dev headers (`libobs` + `obs-frontend-api` pkg-config). Pres
    ```sh
    ffmpeg -f rawvideo -pix_fmt nv12 -s 1280x720 -i out/frames.raw -frames:v 1 frame0.png
    ```
+
+## Tools
+
+- `tools/raw_capture.py` — the reference consumer: demuxes both kinds, writes raw frames, and reports the A/V
+  offset and drift.
+- `tools/appsrc_audio_probe.c` — isolates the ingest-layout question. Pushes planar (one memory per channel, and
+  a single concatenated buffer) versus interleaved float32 into a real
+  `appsrc ! queue ! audioresample ! audioconvert ! avenc_aac ! aacparse ! mpegtsmux` chain, with pad probes
+  counting what leaves each stage:
+
+  ```sh
+  cc -o probe tools/appsrc_audio_probe.c $(pkg-config --cflags --libs gstreamer-app-1.0)
+  ./probe 0 pre /tmp/probe_planar2.ts    # planar, one memory per channel -> rejected
+  ./probe 1 pre /tmp/probe_planar1.ts    # planar, one memory                -> rejected
+  ./probe 2 pre /tmp/probe_inter.ts      # interleaved                       -> passes
+  ```
+
+  This is what proved the consumer has to interleave, without guessing through OBS.
+- `tools/cpu_sampler.py` — per-process CPU over a window, as cpu-seconds and share of one core:
+  `python3 tools/cpu_sampler.py obs=<pid> enc=<pid> 20`. Note that `/proc/stat`'s first line sums **all** CPUs,
+  so converting its delta to wall time divides by the CPU count as well as `HZ`.
 
 ## Verified (this host, OBS 32.2.2)
 
