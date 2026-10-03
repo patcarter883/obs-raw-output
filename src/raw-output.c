@@ -14,30 +14,45 @@
  * tight, fixed layout and write them to a TCP socket. Nothing is encoded.
  *
  * Wire format (all integers little-endian; structs are plain uint32/uint64 so
- * there is no padding to disagree about):
+ * there is no padding to disagree about). Both streams are multiplexed onto the
+ * ONE socket: every frame header carries a kind, so video and audio arrive
+ * interleaved and in order, paced against each other rather than drifting apart
+ * the way two independent sockets would.
  *
  *   stream header (once, on connect)
  *     u32 magic 'OBCR' | u32 version | u32 width | u32 height
  *     u32 fps_num | u32 fps_den | u32 obs_format(enum video_format)
  *     u32 planes | u32 linesize[3] | u32 plane_bytes[3](tight)
  *     u32 reserved
+ *     u32 audio_rate | u32 audio_channels | u32 audio_format | u32 audio_reserved[5]
  *
  * `linesize` is sent as zero and the receiver must ignore it: it is not known
  * until the first frame arrives, while this header goes out at connect. It is
  * kept only so the field layout can grow into it. The receiver relies solely on
  * `plane_bytes`, which describe the tight layout actually written.
- *   frame header (per frame)
- *     u64 timestamp | u32 payload_bytes | u32 planes
- *   frame payload
- *     plane 0, then plane 1, then plane 2, each tightly packed (no stride pad)
  *
- * Planes are sent tight so the receiver's layout depends only on width/height/
- * format, never on OBS's internal line stride.
+ * `audio_rate == 0` means this source has no audio; the audio section is then
+ * all zeroes and no audio frames appear.
+ *
+ *   frame header (per frame or audio chunk)
+ *     u64 timestamp | u32 kind | u32 payload_bytes | u32 units | u32 reserved
+ *   frame payload
+ *     video (kind 0): plane 0, then plane 1, ... each tightly packed (no stride pad)
+ *     audio (kind 1): channel 0, then channel 1, ... each `units * 4` bytes
+ *
+ * SYNCHRONISATION. `timestamp` is OBS's own timestamp in nanoseconds, and OBS
+ * stamps video and audio from the SAME clock -- that is what makes the two
+ * streams alignable at all. The receiver must keep them, not re-stamp.
+ *
+ * Video planes are sent tight so the receiver's layout depends only on
+ * width/height/format, never on OBS's internal line stride. Audio is sent in
+ * OBS's native planar float32 so no interleaving copy is needed on either side.
  */
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <util/platform.h>
+#include <media-io/audio-io.h>
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -54,9 +69,16 @@
 #include <unistd.h>
 
 #define OBC_MAGIC 0x4F424352u /* 'OBCR' */
-#define OBC_VERSION 1u
+/* v2 added the audio section and the frame kind. v1 carried video only, and
+ * nothing consumed it, so there is no shim: receivers must accept v2 only. */
+#define OBC_VERSION 2u
 #define OBC_MAX_PLANES 3
 #define OBC_DEFAULT_TARGET "127.0.0.1:9300"
+/* Payload kinds on the shared socket. */
+#define OBC_KIND_VIDEO 0u
+#define OBC_KIND_AUDIO 1u
+/* Only float32 planar exists here, because that is what OBS hands over. */
+#define OBC_AUDIO_F32_PLANAR 1u
 #define OBC_SEND_TIMEOUT_MS 200
 #define OBC_SNDBUF_BYTES (8 * 1024 * 1024)
 /* ~1.5 s at 60 fps. After the peer goes away (encoder stopped or restarted) the
@@ -75,12 +97,19 @@ struct obc_stream_header {
 	uint32_t linesize[OBC_MAX_PLANES];
 	uint32_t plane_bytes[OBC_MAX_PLANES];
 	uint32_t reserved;
+	/* v2 audio section; audio_rate == 0 means no audio on this connection. */
+	uint32_t audio_rate;
+	uint32_t audio_channels;
+	uint32_t audio_format;
+	uint32_t audio_reserved[5];
 };
 
 struct obc_frame_header {
 	uint64_t timestamp;
+	uint32_t kind;		/* OBC_KIND_VIDEO or OBC_KIND_AUDIO */
 	uint32_t payload_bytes;
-	uint32_t planes;
+	uint32_t units;		/* video: plane count; audio: sample frames */
+	uint32_t reserved;
 };
 
 struct obc_raw {
@@ -103,9 +132,15 @@ struct obc_raw {
 
 	uint64_t frames_sent;
 	uint64_t frames_dropped;
-	uint64_t bytes_sent;
+	uint64_t audio_chunks_sent;
+	uint64_t audio_chunks_dropped;
+	uint64_t bytes_sent; /* video frames + audio chunks, headers included */
 	uint32_t consecutive_failures;
 	bool logged_stride;
+
+	uint32_t audio_rate;
+	uint32_t audio_channels;
+	bool audio_present;
 
 	pthread_mutex_t lock;
 };
@@ -235,6 +270,8 @@ static const char *obc_get_name(void *unused)
 static void obc_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "target", OBC_DEFAULT_TARGET);
+	/* Audio is on by default: the product wants synchronised audio. */
+	obs_data_set_default_bool(settings, "audio", true);
 }
 
 static obs_properties_t *obc_get_properties(void *data)
@@ -248,6 +285,13 @@ static obs_properties_t *obc_get_properties(void *data)
 		"TCP endpoint that receives uncompressed frames. Env var "
 		"OBC_RAW_TARGET overrides this when the output is started from "
 		"the Tools menu.");
+	obs_property_t *audio = obs_properties_add_bool(
+		props, "audio", "Send audio (synchronised with the video)");
+	obs_property_set_long_description(
+		audio,
+		"Sends the OBS audio mix on the same connection, timestamped from "
+		"the same clock as the video so the receiver can align them. "
+		"OBC_RAW_AUDIO=0 overrides this.");
 	UNUSED_PARAMETER(data);
 	return props;
 }
@@ -331,6 +375,23 @@ static bool obc_start(void *data)
 		return false;
 	}
 
+	/* Audio is opt-out, and the announced rate/channels are part of the
+	 * stream header, so resolve it before connecting. */
+	bool want_audio = obs_data_get_bool(settings, "audio");
+	const char *audio_env = getenv("OBC_RAW_AUDIO");
+	if (audio_env && *audio_env)
+		want_audio = strcmp(audio_env, "0") != 0;
+
+	struct obs_audio_info oai;
+	bool have_audio = want_audio && obs_get_audio_info(&oai) &&
+			  oai.samples_per_sec > 0;
+	ctx->audio_present = have_audio;
+	ctx->audio_rate = have_audio ? oai.samples_per_sec : 0;
+	ctx->audio_channels = have_audio ? get_audio_channels(oai.speakers) : 0;
+	/* SPEAKERS_UNKNOWN means "fall back to stereo", per the enum. */
+	if (have_audio && ctx->audio_channels == 0)
+		ctx->audio_channels = 2;
+
 	struct addrinfo hints;
 	struct addrinfo *res = NULL;
 	memset(&hints, 0, sizeof(hints));
@@ -383,6 +444,8 @@ static bool obc_start(void *data)
 	ctx->payload_bytes = payload;
 	ctx->frames_sent = 0;
 	ctx->frames_dropped = 0;
+	ctx->audio_chunks_sent = 0;
+	ctx->audio_chunks_dropped = 0;
 	ctx->bytes_sent = 0;
 	ctx->consecutive_failures = 0;
 	ctx->logged_stride = false;
@@ -399,6 +462,9 @@ static bool obc_start(void *data)
 	hdr.planes = ctx->planes;
 	for (uint32_t i = 0; i < n_planes; i++)
 		hdr.plane_bytes[i] = ctx->plane_bytes[i];
+	hdr.audio_rate = ctx->audio_rate;
+	hdr.audio_channels = ctx->audio_channels;
+	hdr.audio_format = ctx->audio_present ? OBC_AUDIO_F32_PLANAR : 0;
 
 	if (!obc_send_all(fd, &hdr, sizeof(hdr))) {
 		blog(LOG_ERROR, "[obc-raw] failed to send stream header");
@@ -407,15 +473,22 @@ static bool obc_start(void *data)
 		return false;
 	}
 
-	/* No encoders are attached: this is what makes OBS deliver raw frames. */
+	/* No encoders are attached: this is what makes OBS deliver raw frames.
+	 * Audio is requested the same way -- with no service set, nothing else
+	 * has to be configured for OBS to hand the mix over. */
+	const uint32_t capture_flags =
+		OBS_OUTPUT_VIDEO | (ctx->audio_present ? OBS_OUTPUT_AUDIO : 0u);
+
 	obs_output_set_media(ctx->output, obs_get_video(), obs_get_audio());
-	if (!obs_output_can_begin_data_capture(ctx->output, OBS_OUTPUT_VIDEO)) {
-		blog(LOG_ERROR, "[obc-raw] cannot begin raw video capture");
+	if (!obs_output_can_begin_data_capture(ctx->output, capture_flags)) {
+		blog(LOG_ERROR,
+		     "[obc-raw] cannot begin raw capture (flags 0x%x)",
+		     (unsigned)capture_flags);
 		obc_teardown(ctx);
 		obs_data_release(settings);
 		return false;
 	}
-	if (!obs_output_begin_data_capture(ctx->output, OBS_OUTPUT_VIDEO)) {
+	if (!obs_output_begin_data_capture(ctx->output, capture_flags)) {
 		blog(LOG_ERROR, "[obc-raw] begin_data_capture failed");
 		obc_teardown(ctx);
 		obs_data_release(settings);
@@ -429,6 +502,15 @@ static bool obc_start(void *data)
 	     ctx->planes, ctx->payload_bytes,
 	     (double)ctx->payload_bytes * ctx->fps_num / ctx->fps_den * 8.0 / 1e6,
 	     host, port);
+	if (ctx->audio_present)
+		blog(LOG_INFO,
+		     "[obc-raw] audio: %u Hz, %u channel(s), float32 planar "
+		     "(~%.1f Mbit/s), timestamps shared with the video clock",
+		     ctx->audio_rate, ctx->audio_channels,
+		     (double)ctx->audio_rate * ctx->audio_channels * 32.0 / 1e6);
+	else
+		blog(LOG_WARNING,
+		     "[obc-raw] audio disabled; sending video only");
 
 	obs_data_release(settings);
 	return true;
@@ -445,10 +527,15 @@ static void obc_stop(void *data, uint64_t ts)
 	pthread_mutex_lock(&ctx->lock);
 	uint64_t sent = ctx->frames_sent;
 	uint64_t dropped = ctx->frames_dropped;
+	uint64_t chunks = ctx->audio_chunks_sent;
+	uint64_t chunks_dropped = ctx->audio_chunks_dropped;
 	pthread_mutex_unlock(&ctx->lock);
 
-	blog(LOG_INFO, "[obc-raw] stopped after %llu frames (%llu dropped)",
-	     (unsigned long long)sent, (unsigned long long)dropped);
+	blog(LOG_INFO,
+	     "[obc-raw] stopped after %llu frames (%llu dropped) and %llu audio "
+	     "chunks (%llu dropped)",
+	     (unsigned long long)sent, (unsigned long long)dropped,
+	     (unsigned long long)chunks, (unsigned long long)chunks_dropped);
 }
 
 static void obc_raw_video(void *data, struct video_data *frame)
@@ -476,8 +563,10 @@ static void obc_raw_video(void *data, struct video_data *frame)
 
 	struct obc_frame_header fh;
 	fh.timestamp = frame->timestamp;
+	fh.kind = OBC_KIND_VIDEO;
 	fh.payload_bytes = ctx->payload_bytes;
-	fh.planes = ctx->planes;
+	fh.units = ctx->planes;
+	fh.reserved = 0;
 
 	if (!obc_send_all(ctx->fd, &fh, sizeof(fh)))
 		ok = false;
@@ -516,6 +605,63 @@ static void obc_raw_video(void *data, struct video_data *frame)
 	}
 }
 
+/* Audio arrives as PLANAR float32 -- one plane per channel, `frames` samples
+ * each, 4 bytes per sample -- and is sent in exactly that shape, plane by
+ * plane, so neither side pays for an interleaving copy.
+ *
+ * The synchronisation lives in the timestamp: OBS stamps this from the same
+ * clock it stamps video with, and we forward it untouched. Re-stamping here (or
+ * on the far side) is what would actually break A/V sync. */
+static void obc_raw_audio(void *data, struct audio_data *frame)
+{
+	struct obc_raw *ctx = data;
+
+	pthread_mutex_lock(&ctx->lock);
+	if (!ctx->connected || ctx->fd < 0 || !ctx->audio_present ||
+	    frame->frames == 0 || ctx->audio_channels == 0) {
+		pthread_mutex_unlock(&ctx->lock);
+		return;
+	}
+
+	const uint32_t channels = ctx->audio_channels;
+	const uint32_t plane_bytes = frame->frames * 4u; /* float32 */
+
+	struct obc_frame_header fh;
+	fh.timestamp = frame->timestamp;
+	fh.kind = OBC_KIND_AUDIO;
+	fh.payload_bytes = plane_bytes * channels;
+	fh.units = frame->frames;
+	fh.reserved = 0;
+
+	bool ok = obc_send_all(ctx->fd, &fh, sizeof(fh));
+	for (uint32_t c = 0; ok && c < channels; c++)
+		ok = obc_send_all(ctx->fd, frame->data[c], plane_bytes);
+
+	bool signal_stop = false;
+	if (ok) {
+		ctx->audio_chunks_sent++;
+		ctx->bytes_sent += (uint64_t)sizeof(fh) + fh.payload_bytes;
+	} else {
+		/* Deliberately does NOT reset the failure run: video owns the
+		 * reset, so a healthy audio stream cannot mask a dead video
+		 * one. Both fail together anyway -- they share the socket. */
+		ctx->audio_chunks_dropped++;
+		ctx->consecutive_failures++;
+		if (ctx->consecutive_failures >= OBC_MAX_CONSECUTIVE_FAILURES) {
+			ctx->connected = false;
+			signal_stop = true;
+		}
+	}
+
+	pthread_mutex_unlock(&ctx->lock);
+
+	if (signal_stop) {
+		blog(LOG_WARNING,
+		     "[obc-raw] peer unreachable while sending audio; stopping output");
+		obs_output_signal_stop(ctx->output, OBS_OUTPUT_DISCONNECTED);
+	}
+}
+
 static uint64_t obc_get_total_bytes(void *data)
 {
 	struct obc_raw *ctx = data;
@@ -538,13 +684,16 @@ static int obc_get_dropped_frames(void *data)
 
 static struct obs_output_info obc_output_info = {
 	.id = "obc_raw_output",
-	.flags = OBS_OUTPUT_VIDEO,
+	/* AV, not VIDEO: this output is able to take audio, and OBS only offers
+	 * the mix to raw_audio() when the flag says so. */
+	.flags = OBS_OUTPUT_AV,
 	.get_name = obc_get_name,
 	.create = obc_create,
 	.destroy = obc_destroy,
 	.start = obc_start,
 	.stop = obc_stop,
 	.raw_video = obc_raw_video,
+	.raw_audio = obc_raw_audio,
 	.get_defaults = obc_get_defaults,
 	.get_properties = obc_get_properties,
 	.get_total_bytes = obc_get_total_bytes,

@@ -13,6 +13,10 @@ Registers an `obs_output` (`obc_raw_output`) with **no video encoder attached**.
 no encoder, libobs delivers frames to `obs_output_info.raw_video()` unencoded. The plugin copies the
 planes, tightens any line-stride padding, and writes them to a TCP socket.
 
+It does the same for audio: requesting `OBS_OUTPUT_AUDIO` makes libobs hand the mix to
+`obs_output_info.raw_audio()`, so the **synchronised** audio goes out on the same connection, carrying OBS's
+own timestamps.
+
 No encoding, no muxing, no container: `1280x720` NV12/I420 ≈ **1.3 MB per frame**, ~**332 Mbit/s** at 30 fps.
 
 ## Wire format
@@ -20,17 +24,22 @@ No encoding, no muxing, no container: `1280x720` NV12/I420 ≈ **1.3 MB per fram
 All integers little-endian. Structures are plain `uint32`/`uint64`, so there is no padding to disagree about.
 
 ```
-stream header (once, on connect)   15 × u32 = 60 bytes
+stream header (once, on connect)   23 × u32 = 92 bytes
   magic 'OBCR' | version | width | height | fps_num | fps_den
   obs_format (enum video_format) | planes
   linesize[3] | plane_bytes[3] (tight) | reserved
+  audio_rate | audio_channels | audio_format | audio_reserved[5]
 
-frame header (per frame)           16 bytes
-  timestamp (u64, ns) | payload_bytes (u32) | planes (u32)
+frame header (per frame / audio chunk)   24 bytes
+  timestamp (u64, ns) | kind | payload_bytes | units | reserved
 
 frame payload
-  plane 0, plane 1, plane 2 — each tightly packed, no stride padding
+  kind 0 video:  plane 0, plane 1, ... — each tightly packed, no stride padding
+  kind 1 audio:  channel 0, channel 1, ... — each `units × 4` bytes (float32)
 ```
+
+`version` is **2**. v1 was video-only with a 16-byte frame header, and nothing consumed it, so there is no
+compatibility shim — **receivers must accept v2 only**.
 
 Planes go out tight so the receiver's layout depends only on `width`/`height`/`format`, never on OBS's
 internal line stride — the plugin repacks row by row whenever OBS's stride is wider than the row, and logs
@@ -41,6 +50,32 @@ connect time. It is kept only so the layout can grow into it. **Receivers must i
 `plane_bytes` alone.**
 
 OBS `video_format` values are the enum's declaration order: `I420=1`, `NV12=2`, `YUY2=4`, `UYVY=5`, `BGRA=7`.
+
+## Audio and synchronisation
+
+Audio travels on the **same connection** as the video, multiplexed by the frame header's `kind`. One socket
+was chosen over a second port deliberately: the streams stay ordered and paced against each other, where two
+independent sockets can diverge under load and leave the receiver reconciling buffers.
+
+Audio is **planar float32** — OBS's native layout, one plane per channel — so neither side pays for an
+interleaving copy. `audio_rate == 0` in the header means the source has no audio and no audio kinds appear;
+otherwise `audio_channels` and `audio_rate` describe every chunk.
+
+**Sync is carried entirely by the timestamps.** OBS stamps video and audio from the same clock and the plugin
+forwards those timestamps untouched; re-stamping on either side is what would actually break A/V sync.
+`tools/raw_capture.py` measures the result by taking the median audio-to-video offset over each end of the
+run, so the ±half-frame interleave jitter averages out. A 12 s run on this host:
+
+```
+received 720 uncompressed video frames in 12.0s (video span 11.98s => 60.08 fps)
+received 560 audio chunks = 573440 frames (11.95s of audio at 48000 Hz)
+sync: audio-video timestamp offset -0.14 ms at the start, -0.48 ms at the end
+      drift -0.33 ms over 11.98s -> no drift (streams share OBS's clock)
+```
+
+Sub-millisecond alignment, and a drift of 0.33 ms over 12 s — far inside one video frame interval.
+
+Audio is **opt-out**: it is sent by default, and `OBC_RAW_AUDIO=0` (or the "Send audio" setting) disables it.
 
 ## Build and install
 
@@ -91,6 +126,9 @@ sustained 60.03 fps** with **zero frame loss** (1800 frames over a 29.98 s span)
 produced a correct image (right colours, geometry, no stride artefacts). Frame 0 was blank because capture
 started before the scene rendered — expected, not a bug.
 
+Audio came with it: `48000 Hz, 2 channel(s), float32 planar`, and over a 12 s run **560 chunks / 4.6 MB =
+11.95 s of audio** against 11.98 s of video, with the sync measurement shown above.
+
 ## Gotchas found by running it for real
 
 - **Do not hold the output's lock across `obs_output_end_data_capture()`.** It waits for the streaming thread
@@ -102,10 +140,16 @@ started before the scene rendered — expected, not a bug.
 - The libobs `.pc` files carry **no `-I`** for their own headers (which live under `obs/`); CMake has to add
   that path explicitly.
 - The receiver must set a **socket timeout** — a stalled-but-open peer otherwise blocks the reader forever.
+- **On a shared socket, let only one stream own the failure reset.** A dead peer fails video and audio
+  together, so if audio also reset the counter a healthy audio stream could mask a dead video one. Audio
+  increments the run, video owns the reset, and either may trip the stop.
+- The two callbacks arrive on **different threads** and share one socket, so the send path is serialised by
+  the same lock the video path already used — the interleaved writes stay frame-aligned.
 
 ## Status
 
-- **Phase 0: done.** Uncompressed frames leave OBS and arrive intact, proven on this host.
+- **Phase 0: done.** Uncompressed frames *and synchronised audio* leave OBS and arrive intact, proven on
+  this host (A/V offset under 1 ms, no drift).
 - **Phase 1:** the encoder grows `input_mode::raw_local`, which listens on the same port and pushes the
   frames into its GStreamer pipeline via `appsrc` — so the encode stage runs exactly once, in the encoder.
 
