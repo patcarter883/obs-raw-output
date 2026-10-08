@@ -718,9 +718,52 @@ static struct obs_output_info obc_output_info = {
 
 /* -------------------------------------------------------------------- menu */
 
+/* Implemented in obc-settings-dialog.cpp (Qt). Fills target/audio and returns
+ * true only when the operator accepted the dialog. */
+extern bool obc_settings_dialog_run(char *target, size_t target_len,
+				    bool *audio);
+
+/* Settings live in the plugin's own config, never in the OBS profile: the
+ * operator's target has to survive a restart, and the profile belongs to the
+ * user. Missing keys mean "never set", not "send nowhere". */
+static obs_data_t *obc_load_config(void)
+{
+	char *path = obs_module_config_path("settings.json");
+	obs_data_t *data = NULL;
+
+	if (path) {
+		data = obs_data_create_from_json_file(path);
+		bfree(path);
+	}
+	if (!data)
+		data = obs_data_create();
+	return data;
+}
+
+static void obc_save_config(const char *target, bool audio)
+{
+	char *dir = obs_module_config_path("");
+	if (dir) {
+		os_mkdirs(dir);
+		bfree(dir);
+	}
+
+	char *path = obs_module_config_path("settings.json");
+	if (!path)
+		return;
+
+	obs_data_t *data = obs_data_create();
+	obs_data_set_string(data, "target", target);
+	obs_data_set_bool(data, "audio", audio);
+	obs_data_save_json(data, path);
+	obs_data_release(data);
+	bfree(path);
+}
+
 /* Registered with no service, so nothing in Settings starts it. Like the NDI
- * output, it is driven from Tools. A real properties dialog lands when this is
- * wired into the product; OBC_RAW_TARGET keeps it scriptable until then. */
+ * output, it is driven from Tools: one item starts/stops it, one opens the
+ * settings dialog. OBC_RAW_TARGET still overrides the saved target, which
+ * keeps automated runs scriptable. */
 static obs_output_t *obc_menu_output = NULL;
 
 static void obc_start_output(void)
@@ -728,8 +771,22 @@ static void obc_start_output(void)
 	if (obc_menu_output && obs_output_active(obc_menu_output))
 		return;
 
+	/* The operator's saved target, falling back to the built-in default.
+	 * Only the Tools-menu path reads the saved value; OBC_RAW_TARGET still
+	 * overrides it inside obc_start(). */
+	obs_data_t *saved = obc_load_config();
 	obs_data_t *settings = obs_data_create();
-	obs_data_set_string(settings, "target", OBC_DEFAULT_TARGET);
+	obs_data_set_default_string(settings, "target", OBC_DEFAULT_TARGET);
+	obs_data_set_default_bool(settings, "audio", true);
+
+	const char *saved_target = obs_data_get_string(saved, "target");
+	if (saved_target && *saved_target)
+		obs_data_set_string(settings, "target", saved_target);
+	if (obs_data_has_user_value(saved, "audio"))
+		obs_data_set_bool(settings, "audio",
+				  obs_data_get_bool(saved, "audio"));
+	obs_data_release(saved);
+
 	obc_menu_output = obs_output_create("obc_raw_output", "obc_raw_output",
 					    settings, NULL);
 	obs_data_release(settings);
@@ -752,6 +809,50 @@ static void obc_menu_toggle(void *private_data)
 		return;
 	}
 	obc_start_output();
+}
+
+/* The settings dialog is the only place these two values can be set: the
+ * output has no service, so OBS shows its properties nowhere else. */
+static void obc_menu_settings(void *private_data)
+{
+	UNUSED_PARAMETER(private_data);
+
+	obs_data_t *saved = obc_load_config();
+	char target[256];
+	bool audio = true;
+
+	const char *saved_target = obs_data_get_string(saved, "target");
+	if (saved_target && *saved_target)
+		snprintf(target, sizeof(target), "%s", saved_target);
+	else
+		snprintf(target, sizeof(target), "%s", OBC_DEFAULT_TARGET);
+	if (obs_data_has_user_value(saved, "audio"))
+		audio = obs_data_get_bool(saved, "audio");
+	obs_data_release(saved);
+
+	if (!obc_settings_dialog_run(target, sizeof(target), &audio)) {
+		blog(LOG_INFO,
+		     "[obc-raw] settings dialog closed without changes");
+		return;
+	}
+
+	obc_save_config(target, audio);
+
+	/* Re-create the output when it is live, so the operator sees the change
+	 * take effect on OK rather than at some later start. */
+	const bool was_active =
+		obc_menu_output && obs_output_active(obc_menu_output);
+	if (was_active)
+		obs_output_stop(obc_menu_output);
+	if (obc_menu_output) {
+		obs_output_release(obc_menu_output);
+		obc_menu_output = NULL;
+	}
+
+	blog(LOG_INFO, "[obc-raw] target %s, audio %s", target,
+	     audio ? "on" : "off");
+	if (was_active)
+		obc_start_output();
 }
 
 /* Automated runs (and CI) have no way to open the Tools menu, so allow the
@@ -779,6 +880,9 @@ bool obs_module_load(void)
 	obs_register_output(&obc_output_info);
 	obs_frontend_add_tools_menu_item(
 		"Open Broadcast raw output (start/stop)", obc_menu_toggle, NULL);
+	obs_frontend_add_tools_menu_item(
+		"Open Broadcast raw output (settings...)", obc_menu_settings,
+		NULL);
 	obs_frontend_add_event_callback(obc_frontend_event, NULL);
 	blog(LOG_INFO,
 	     "[obc-raw] loaded: uncompressed frame output registered as 'obc_raw_output'");
