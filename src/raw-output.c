@@ -875,9 +875,22 @@ static void obc_menu_settings(void *private_data)
 /* Automated runs (and CI) have no way to open the Tools menu, so allow the
  * output to start itself once OBS has finished loading. Opt-in, never default:
  * OBC_RAW_AUTOSTART=1 ./obs */
+static bool obc_frontend_exit_seen = false;
+
 static void obc_frontend_event(enum obs_frontend_event event, void *private_data)
 {
 	UNUSED_PARAMETER(private_data);
+
+	if (event == OBS_FRONTEND_EVENT_EXIT) {
+		/* libobs unloads modules AFTER it has torn the frontend down. By
+		 * then obs_frontend_remove_event_callback() finds no callbacks
+		 * and OBS logs
+		 *   "Tried to call obs_frontend_remove_event_callback with no callbacks!"
+		 * The frontend announces its own teardown here, so remember it
+		 * and let obs_module_unload() skip the doomed remove. */
+		obc_frontend_exit_seen = true;
+		return;
+	}
 
 	if (event != OBS_FRONTEND_EVENT_FINISHED_LOADING)
 		return;
@@ -908,7 +921,14 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
-	obs_frontend_remove_event_callback(obc_frontend_event, NULL);
+	/* libobs unloads modules after the frontend has been shut down, so on a
+	 * normal exit OBS_FRONTEND_EVENT_EXIT has already fired and the
+	 * frontend callbacks are gone; removing ours then would only log
+	 * "Tried to call obs_frontend_remove_event_callback with no callbacks!".
+	 * Remove only when the exit was not seen -- i.e. the module is being
+	 * unloaded while the frontend is still alive. */
+	if (!obc_frontend_exit_seen)
+		obs_frontend_remove_event_callback(obc_frontend_event, NULL);
 
 	if (obc_menu_output != NULL) {
 		if (obs_output_active(obc_menu_output))

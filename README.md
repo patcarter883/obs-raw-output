@@ -242,6 +242,12 @@ OBC_RAW_AUTOSTART=1 OBC_RAW_TARGET=127.0.0.1:9300 obs --disable-shutdown-check
 
 ## Gotchas found by running it for real
 
+- **Remove the frontend event callback on `OBS_FRONTEND_EVENT_EXIT`, not in `obs_module_unload`.** libobs
+  unloads modules *after* it has torn the frontend down, so an
+  `obs_frontend_remove_event_callback()` there finds no callbacks and OBS logs
+  `Tried to call obs_frontend_remove_event_callback with no callbacks!` once per exit. The plugin records
+  the EXIT event (delivered while the frontend is still alive) and skips the remove on that path; the remove
+  still runs if the module is ever unloaded while the frontend is alive (the plugin manager).
 - **Never hold the output's lock across `obs_output_end_data_capture()`.** It waits for the streaming thread,
   which takes the same lock in `raw_video` — so OBS deadlocks on shutdown and only SIGKILL clears it.
   Teardown runs unlocked.
