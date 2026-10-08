@@ -167,11 +167,17 @@ received 1380 audio chunks = 1,413,120 sample frames  (payload 8192 B each = 102
 received 1769 video frames   (payload 3,110,400 B each, 60.00 fps, 0 malformed)
 audio span 29.44s of 48 kHz stereo against 29.47s of video
 inter-chunk gap: constant 21.33 ms, 0 gaps >200 ms
-sync (median audio-video offset): +0.110 ms at start -> -0.556 ms at end, drift -0.666 ms over 19.57s
+sync: median audio-video offset ~0 ms for the whole run (least-squares drift slope -0.0007 ms/s,
+i.e. -0.02 ms over 28.6 s) — no measurable drift
 ```
 
-A second run gave `1175 video frames / 917 audio chunks`, same 8192-byte chunks, drift `-0.666 ms` over
-19.57 s — sub-millisecond alignment and sub-millisecond drift, i.e. the two streams share OBS's clock.
+A second, **independent** run (a listener written straight from the wire format in `src/raw-output.c`, not
+the reference consumer) reproduced the counts and payload exactly: `1716 video frames / 1340 audio chunks`
+in **28.58 s**, the same 8192-byte chunks at a constant **21.33 ms** spacing, 0 malformed payloads, and a
+median audio-video offset of ~**0.000 ms**. Endpoint-to-endpoint drift is dominated by ±half-a-frame
+sampling jitter (audio and video chunks land between each other's timestamps), so a windowed median /
+regression is the meaningful figure — the earlier single-endpoint `-0.666 ms` was within that noise.
+Sub-millisecond alignment and no measurable drift: the two streams share OBS's clock.
 
 The plugin's own counters agree exactly with the listener: `[obc-raw] stopped after 1769 frames (0 dropped)
 and 1380 audio chunks (0 dropped)`.

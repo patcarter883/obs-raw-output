@@ -137,6 +137,9 @@ struct obc_raw {
 	uint64_t bytes_sent; /* video frames + audio chunks, headers included */
 	uint32_t consecutive_failures;
 	bool logged_stride;
+	/* Set once the stop path has run, so a shutdown delivered by two libobs
+	 * paths reports and tears down only once per start. */
+	bool stopped;
 
 	uint32_t audio_rate;
 	uint32_t audio_channels;
@@ -465,6 +468,7 @@ static bool obc_start(void *data)
 	ctx->bytes_sent = 0;
 	ctx->consecutive_failures = 0;
 	ctx->logged_stride = false;
+	ctx->stopped = false;
 
 	struct obc_stream_header hdr;
 	memset(&hdr, 0, sizeof(hdr));
@@ -536,6 +540,17 @@ static void obc_stop(void *data, uint64_t ts)
 {
 	struct obc_raw *ctx = data;
 	UNUSED_PARAMETER(ts);
+
+	/* libobs can deliver a single shutdown through more than one path (the
+	 * frontend teardown and module unload both call stop), so make this
+	 * idempotent: report and tear down exactly once per start. */
+	pthread_mutex_lock(&ctx->lock);
+	if (ctx->stopped) {
+		pthread_mutex_unlock(&ctx->lock);
+		return;
+	}
+	ctx->stopped = true;
+	pthread_mutex_unlock(&ctx->lock);
 
 	/* Unlocked on purpose: see obc_teardown(). */
 	obc_teardown(ctx);
@@ -693,7 +708,9 @@ static int obc_get_dropped_frames(void *data)
 	struct obc_raw *ctx = data;
 	int dropped;
 	pthread_mutex_lock(&ctx->lock);
-	dropped = (int)ctx->frames_dropped;
+	/* OBS shows this number as "dropped frames"; audio drops are invisible
+	 * otherwise, so count them too. */
+	dropped = (int)(ctx->frames_dropped + ctx->audio_chunks_dropped);
 	pthread_mutex_unlock(&ctx->lock);
 	return dropped;
 }
