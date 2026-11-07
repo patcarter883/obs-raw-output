@@ -344,9 +344,6 @@ static void obc_destroy(void *data)
  * called with ctx->lock held, or OBS deadlocks on shutdown. */
 static void obc_teardown(struct obc_raw *ctx)
 {
-	if (obs_output_active(ctx->output))
-		obs_output_end_data_capture(ctx->output);
-
 	pthread_mutex_lock(&ctx->lock);
 	if (ctx->fd >= 0) {
 		close(ctx->fd);
@@ -608,6 +605,12 @@ static void obc_stop(void *data, uint64_t ts)
 
 	/* Unlocked on purpose: see obc_teardown(). */
 	obc_teardown(ctx);
+
+	/* Unconditional, and exactly once per start: libobs calls `stop` during
+	 * shutdown AFTER the output stops being active, so gating this on
+	 * obs_output_active() left the end unsignalled and obs_output_release()
+	 * waiting on an event that never came -- OBS hung on exit. */
+	obs_output_end_data_capture(ctx->output);
 
 	pthread_mutex_lock(&ctx->lock);
 	uint64_t sent = ctx->frames_sent;
