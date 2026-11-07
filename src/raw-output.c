@@ -783,6 +783,29 @@ static void obc_save_config(const char *target, bool audio)
  * keeps automated runs scriptable. */
 static obs_output_t *obc_menu_output = NULL;
 
+/* Implemented in menu-action.cpp (Qt): a checkable Tools item, because the
+ * plain menu-item API gives the operator no sign of whether the output runs. */
+extern void *obc_menu_action_create(const char *name, void (*on_toggled)(bool));
+extern void obc_menu_action_set_checked(void *action, bool checked);
+
+static void *obc_menu_action = NULL;
+
+static void obc_menu_on_started(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(cd);
+	blog(LOG_INFO, "[obc-raw] output running");
+	obc_menu_action_set_checked(obc_menu_action, true);
+}
+
+static void obc_menu_on_stopped(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(cd);
+	blog(LOG_INFO, "[obc-raw] output stopped");
+	obc_menu_action_set_checked(obc_menu_action, false);
+}
+
 static void obc_start_output(void)
 {
 	if (obc_menu_output && obs_output_active(obc_menu_output))
@@ -810,22 +833,32 @@ static void obc_start_output(void)
 
 	if (!obc_menu_output) {
 		blog(LOG_ERROR, "[obc-raw] could not create output");
+		obc_menu_action_set_checked(obc_menu_action, false);
 		return;
 	}
-	if (!obs_output_start(obc_menu_output))
+
+	/* The menu state follows the output, not the click: OBS can stop it on
+	 * its own (reconnect failure, exit), and a checkbox that lies is worse
+	 * than none. */
+	signal_handler_t *sh = obs_output_get_signal_handler(obc_menu_output);
+	signal_handler_connect(sh, "start", obc_menu_on_started, NULL);
+	signal_handler_connect(sh, "stop", obc_menu_on_stopped, NULL);
+
+	if (!obs_output_start(obc_menu_output)) {
 		blog(LOG_ERROR,
 		     "[obc-raw] start failed (see the error above; is the receiver listening?)");
+		obc_menu_action_set_checked(obc_menu_action, false);
+	}
 }
 
-static void obc_menu_toggle(void *private_data)
+static void obc_menu_action_toggled(bool checked)
 {
-	UNUSED_PARAMETER(private_data);
-
-	if (obc_menu_output && obs_output_active(obc_menu_output)) {
-		obs_output_stop(obc_menu_output);
+	if (checked) {
+		obc_start_output();
 		return;
 	}
-	obc_start_output();
+	if (obc_menu_output && obs_output_active(obc_menu_output))
+		obs_output_stop(obc_menu_output);
 }
 
 /* The settings dialog is the only place these two values can be set: the
@@ -908,8 +941,9 @@ OBS_MODULE_USE_DEFAULT_LOCALE("open-broadcast-raw-output", "en-US")
 bool obs_module_load(void)
 {
 	obs_register_output(&obc_output_info);
-	obs_frontend_add_tools_menu_item(
-		"Open Broadcast raw output (start/stop)", obc_menu_toggle, NULL);
+	obc_menu_action = obc_menu_action_create(
+		"Open Broadcast raw output (start/stop)",
+		obc_menu_action_toggled);
 	obs_frontend_add_tools_menu_item(
 		"Open Broadcast raw output (settings...)", obc_menu_settings,
 		NULL);

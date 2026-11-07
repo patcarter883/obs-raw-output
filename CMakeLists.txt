@@ -37,7 +37,8 @@ find_path(OBS_INCLUDE_DIR obs-module.h
 
 add_library(open-broadcast-raw-output MODULE
   src/raw-output.c
-  src/obc-settings-dialog.cpp)
+  src/obc-settings-dialog.cpp
+  src/menu-action.cpp)
 
 # Marked SYSTEM: warnings from third-party headers are not our code's problem to
 # silence, and keeping them out of our warning view makes our own -Wextra output
