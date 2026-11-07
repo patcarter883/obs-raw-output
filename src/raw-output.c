@@ -117,6 +117,12 @@ struct obc_raw {
 
 	int fd;
 	bool connected;
+	/* Kept so a lost peer can be re-dialled without the operator restarting
+	 * the output: an encoder restart must cost a second of frames, not the
+	 * whole stream. */
+	char host[256];
+	char port[32];
+	uint64_t next_reconnect_ms;
 
 	uint32_t width;
 	uint32_t height;
@@ -350,6 +356,51 @@ static void obc_teardown(struct obc_raw *ctx)
 	pthread_mutex_unlock(&ctx->lock);
 }
 
+static uint64_t obc_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* Re-dial the encoder after the link drops, at most once a second. The output
+ * stays STARTED: an encoder restart must cost a second of frames, not the
+ * operator's stream. */
+static bool obc_reconnect(struct obc_raw *ctx)
+{
+	const uint64_t now = obc_now_ms();
+	if (now < ctx->next_reconnect_ms)
+		return false;
+	ctx->next_reconnect_ms = now + 1000;
+
+	struct addrinfo hints;
+	struct addrinfo *res = NULL;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if (getaddrinfo(ctx->host, ctx->port, &hints, &res) != 0)
+		return false;
+
+	int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+	bool ok = false;
+	if (fd >= 0) {
+		obc_set_send_timeout(fd);
+		if (connect(fd, res->ai_addr, res->ai_addrlen) == 0) {
+			ctx->fd = fd;
+			ctx->connected = true;
+			ctx->consecutive_failures = 0;
+			ctx->logged_stride = false;
+			ok = true;
+			blog(LOG_INFO, "[obc-raw] reconnected to %s:%s", ctx->host,
+			     ctx->port);
+		} else {
+			close(fd);
+		}
+	}
+	freeaddrinfo(res);
+	return ok;
+}
+
 static bool obc_start(void *data)
 {
 	struct obc_raw *ctx = data;
@@ -372,6 +423,9 @@ static bool obc_start(void *data)
 	memcpy(host, target, (size_t)(colon - target));
 	host[colon - target] = '\0';
 	snprintf(port, sizeof(port), "%s", colon + 1);
+
+	snprintf(ctx->host, sizeof(ctx->host), "%s", host);
+	snprintf(ctx->port, sizeof(ctx->port), "%s", port);
 
 	struct obs_video_info ovi;
 	if (!obs_get_video_info(&ovi)) {
@@ -575,8 +629,10 @@ static void obc_raw_video(void *data, struct video_data *frame)
 
 	pthread_mutex_lock(&ctx->lock);
 	if (!ctx->connected || ctx->fd < 0) {
-		pthread_mutex_unlock(&ctx->lock);
-		return;
+		if (!obc_reconnect(ctx)) {
+			pthread_mutex_unlock(&ctx->lock);
+			return;
+		}
 	}
 
 	/* Planes are repacked to the tight layout announced at connect, so OBS's
@@ -620,6 +676,11 @@ static void obc_raw_video(void *data, struct video_data *frame)
 		ctx->consecutive_failures++;
 		if (ctx->consecutive_failures >= OBC_MAX_CONSECUTIVE_FAILURES) {
 			ctx->connected = false;
+			if (ctx->fd >= 0) {
+				close(ctx->fd);
+				ctx->fd = -1;
+			}
+			ctx->consecutive_failures = 0;
 			signal_stop = true;
 		}
 	}
@@ -630,9 +691,7 @@ static void obc_raw_video(void *data, struct video_data *frame)
 	 * calling it while held would deadlock the video thread. */
 	if (signal_stop) {
 		blog(LOG_WARNING,
-		     "[obc-raw] peer unreachable for %d consecutive frames; stopping output",
-		     OBC_MAX_CONSECUTIVE_FAILURES);
-		obs_output_signal_stop(ctx->output, OBS_OUTPUT_DISCONNECTED);
+		     "[obc-raw] peer lost; dropping frames and reconnecting");
 	}
 }
 
@@ -680,6 +739,11 @@ static void obc_raw_audio(void *data, struct audio_data *frame)
 		ctx->consecutive_failures++;
 		if (ctx->consecutive_failures >= OBC_MAX_CONSECUTIVE_FAILURES) {
 			ctx->connected = false;
+			if (ctx->fd >= 0) {
+				close(ctx->fd);
+				ctx->fd = -1;
+			}
+			ctx->consecutive_failures = 0;
 			signal_stop = true;
 		}
 	}
@@ -688,8 +752,7 @@ static void obc_raw_audio(void *data, struct audio_data *frame)
 
 	if (signal_stop) {
 		blog(LOG_WARNING,
-		     "[obc-raw] peer unreachable while sending audio; stopping output");
-		obs_output_signal_stop(ctx->output, OBS_OUTPUT_DISCONNECTED);
+		     "[obc-raw] peer lost while sending audio; dropping and reconnecting");
 	}
 }
 
