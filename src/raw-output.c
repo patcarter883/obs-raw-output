@@ -123,6 +123,11 @@ struct obc_raw {
 	char host[256];
 	char port[32];
 	uint64_t next_reconnect_ms;
+	/* The stream header, kept so a reconnect re-announces the geometry. The
+	 * encoder reads exactly one per connection; dialling again and sending
+	 * only frame headers leaves it reading a frame as a stream header. */
+	struct obc_stream_header shdr;
+	bool shdr_valid;
 
 	uint32_t width;
 	uint32_t height;
@@ -382,7 +387,9 @@ static bool obc_reconnect(struct obc_raw *ctx)
 	bool ok = false;
 	if (fd >= 0) {
 		obc_set_send_timeout(fd);
-		if (connect(fd, res->ai_addr, res->ai_addrlen) == 0) {
+		if (connect(fd, res->ai_addr, res->ai_addrlen) == 0
+		    && (!ctx->shdr_valid
+			|| obc_send_all(fd, &ctx->shdr, sizeof(ctx->shdr)))) {
 			ctx->fd = fd;
 			ctx->connected = true;
 			ctx->consecutive_failures = 0;
@@ -537,6 +544,8 @@ static bool obc_start(void *data)
 	hdr.audio_channels = ctx->audio_channels;
 	hdr.audio_format = ctx->audio_present ? OBC_AUDIO_F32_PLANAR : 0;
 
+	ctx->shdr = hdr;
+	ctx->shdr_valid = true;
 	if (!obc_send_all(fd, &hdr, sizeof(hdr))) {
 		blog(LOG_ERROR, "[obc-raw] failed to send stream header");
 		obc_teardown(ctx);
