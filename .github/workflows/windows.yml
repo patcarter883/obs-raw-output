@@ -63,33 +63,66 @@ jobs:
       - name: Generate import libraries
         shell: pwsh
         run: |
-          # The release ships DLLs, not .lib files. dumpbin lists the exports;
-          # lib turns that list into the import library the linker needs.
-          New-Item -ItemType Directory -Force obs-lib | Out-Null
-          foreach ($name in @('obs', 'obs-frontend-api')) {
-            $dll = "obs-release/bin/64bit/$name.dll"
-            if (-not (Test-Path $dll)) {
-              Write-Host "::error::$dll missing from the OBS release"
-              throw "$dll missing from the OBS release"
+          # Resolve the tools explicitly rather than trusting PATH, and report
+          # any failure as an annotation: the log download needs repository
+          # admin rights, so annotations are the only readable channel.
+          $ErrorActionPreference = 'Stop'
+          try {
+            $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)?.Source
+            $lib = (Get-Command lib.exe -ErrorAction SilentlyContinue)?.Source
+            if (-not $dumpbin -or -not $lib) {
+              $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+              if (Test-Path $vswhere) {
+                $vs = & $vswhere -latest -products * `
+                  -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                  -property installationPath
+                $toolset = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory |
+                  Sort-Object Name -Descending | Select-Object -First 1
+                $host = "$($toolset.FullName)\bin\Hostx64\x64"
+                if (-not $dumpbin) { $dumpbin = "$host\dumpbin.exe" }
+                if (-not $lib) { $lib = "$host\lib.exe" }
+              }
             }
-            $exports = @(dumpbin /nologo /exports $dll |
-              Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$' |
-              ForEach-Object { $_.Matches[0].Groups[1].Value })
-            # obs.dll exports well over a thousand symbols; a handful means the
-            # parse missed, and a truncated import library fails at link time
-            # with a misleading "unresolved external" instead.
-            if ($exports.Count -lt 50) {
-              $sample = (dumpbin /nologo /exports $dll | Select-Object -First 40) -join ' | '
-              Write-Host "::error::$($exports.Count) exports parsed from $name.dll; dumpbin said: $sample"
-              throw "only $($exports.Count) exports parsed from $dll"
+            foreach ($t in @($dumpbin, $lib)) {
+              if (-not $t -or -not (Test-Path $t)) {
+                Write-Host "::error::tool not found: $t"
+                throw "tool not found: $t"
+              }
             }
-            @("LIBRARY $name.dll", 'EXPORTS') + $exports | Set-Content -Encoding ASCII "$name.def"
-            lib /nologo /def:"$name.def" /machine:x64 /out:"obs-lib/$name.lib"
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "::error::lib failed for $name (exit $LASTEXITCODE)"
-              throw "lib failed for $name"
+            Write-Host "dumpbin: $dumpbin"
+            Write-Host "lib:     $lib"
+
+            # The release ships DLLs, not .lib files. dumpbin lists the exports;
+            # lib turns that list into the import library the linker needs.
+            New-Item -ItemType Directory -Force obs-lib | Out-Null
+            foreach ($name in @('obs', 'obs-frontend-api')) {
+              $dll = "obs-release/bin/64bit/$name.dll"
+              if (-not (Test-Path $dll)) {
+                Write-Host "::error::$dll missing from the OBS release"
+                throw "$dll missing from the OBS release"
+              }
+              $exports = @(& $dumpbin /nologo /exports $dll |
+                Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$' |
+                ForEach-Object { $_.Matches[0].Groups[1].Value })
+              # obs.dll exports well over a thousand symbols; a handful means the
+              # parse missed, and a truncated import library fails at link time
+              # with a misleading "unresolved external" instead.
+              if ($exports.Count -lt 50) {
+                $sample = (& $dumpbin /nologo /exports $dll | Select-Object -First 20) -join ' | '
+                Write-Host "::error::$($exports.Count) exports parsed from $name.dll; first lines: $sample"
+                throw "only $($exports.Count) exports parsed from $dll"
+              }
+              @("LIBRARY $name.dll", 'EXPORTS') + $exports | Set-Content -Encoding ASCII "$name.def"
+              & $lib /nologo /def:"$name.def" /machine:x64 /out:"obs-lib/$name.lib"
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "::error::lib failed for $name (exit $LASTEXITCODE)"
+                throw "lib failed for $name"
+              }
+              Write-Host "$name: $($exports.Count) exports"
             }
-            Write-Host "$name: $($exports.Count) exports"
+          } catch {
+            Write-Host "::error::$($_.Exception.Message)"
+            exit 1
           }
 
       - name: Configure
