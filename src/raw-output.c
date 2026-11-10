@@ -54,19 +54,39 @@
 #include <util/platform.h>
 #include <media-io/audio-io.h>
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
+
+/* Sockets and timers: POSIX names on Unix, Winsock on Windows. The rest of the
+ * plugin (frame layout, OBS plumbing) is platform-neutral C. */
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
+typedef SOCKET obc_socket_t;
+#  define OBC_NO_SOCKET INVALID_SOCKET
+#  define obc_close_socket closesocket
+/* Winsock never raises SIGPIPE, so a send to a dead peer returns an error. */
+#  define OBC_MSG_NOSIGNAL 0
+#  define obc_interrupted() false
+#else
+#  include <arpa/inet.h>
+#  include <netdb.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <sys/socket.h>
+#  include <sys/time.h>
+#  include <unistd.h>
+typedef int obc_socket_t;
+#  define OBC_NO_SOCKET (-1)
+#  define obc_close_socket close
+#  define OBC_MSG_NOSIGNAL MSG_NOSIGNAL
+#  define obc_interrupted() (errno == EINTR)
+#endif
 
 #define OBC_MAGIC 0x4F424352u /* 'OBCR' */
 /* v2 added the audio section and the frame kind. v1 carried video only, and
@@ -115,7 +135,7 @@ struct obc_frame_header {
 struct obc_raw {
 	obs_output_t *output;
 
-	int fd;
+	obc_socket_t fd;
 	bool connected;
 	/* Kept so a lost peer can be re-dialled without the operator restarting
 	 * the output: an encoder restart must cost a second of frames, not the
@@ -237,12 +257,26 @@ static bool obc_geometry(uint32_t format,
 
 /* ------------------------------------------------------------------ network */
 
-static void obc_set_send_timeout(int fd)
+static const char *obc_socket_error_text(void)
 {
+#ifdef _WIN32
+	return "see Winsock error (WSA) code";
+#else
+	return strerror(errno);
+#endif
+}
+
+static void obc_set_send_timeout(obc_socket_t fd)
+{
+#ifdef _WIN32
+	DWORD ms = OBC_SEND_TIMEOUT_MS;
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&ms, sizeof(ms));
+#else
 	struct timeval tv;
 	tv.tv_sec = 0;
 	tv.tv_usec = OBC_SEND_TIMEOUT_MS * 1000;
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 
 	int sndbuf = OBC_SNDBUF_BYTES;
 	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
@@ -251,17 +285,18 @@ static void obc_set_send_timeout(int fd)
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
-static bool obc_send_all(int fd, const void *buf, size_t len)
+static bool obc_send_all(obc_socket_t fd, const void *buf, size_t len)
 {
 	const uint8_t *p = buf;
 	while (len > 0) {
-		ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+		const int n = (int)send(fd, (const char *)p, (int)len,
+					OBC_MSG_NOSIGNAL);
 		if (n > 0) {
 			p += n;
 			len -= (size_t)n;
 			continue;
 		}
-		if (n < 0 && errno == EINTR)
+		if (n < 0 && obc_interrupted())
 			continue;
 		return false;
 	}
@@ -327,7 +362,7 @@ static void *obc_create(obs_data_t *settings, obs_output_t *output)
 {
 	struct obc_raw *ctx = bzalloc(sizeof(struct obc_raw));
 	ctx->output = output;
-	ctx->fd = -1;
+	ctx->fd = OBC_NO_SOCKET;
 	pthread_mutex_init(&ctx->lock, NULL);
 	UNUSED_PARAMETER(settings);
 	return ctx;
@@ -336,9 +371,9 @@ static void *obc_create(obs_data_t *settings, obs_output_t *output)
 static void obc_destroy(void *data)
 {
 	struct obc_raw *ctx = data;
-	if (ctx->fd >= 0) {
-		close(ctx->fd);
-		ctx->fd = -1;
+	if (ctx->fd != OBC_NO_SOCKET) {
+		obc_close_socket(ctx->fd);
+		ctx->fd = OBC_NO_SOCKET;
 	}
 	pthread_mutex_destroy(&ctx->lock);
 	bfree(ctx);
@@ -350,9 +385,9 @@ static void obc_destroy(void *data)
 static void obc_teardown(struct obc_raw *ctx)
 {
 	pthread_mutex_lock(&ctx->lock);
-	if (ctx->fd >= 0) {
-		close(ctx->fd);
-		ctx->fd = -1;
+	if (ctx->fd != OBC_NO_SOCKET) {
+		obc_close_socket(ctx->fd);
+		ctx->fd = OBC_NO_SOCKET;
 	}
 	ctx->connected = false;
 	pthread_mutex_unlock(&ctx->lock);
@@ -360,9 +395,13 @@ static void obc_teardown(struct obc_raw *ctx)
 
 static uint64_t obc_now_ms(void)
 {
+#ifdef _WIN32
+	return (uint64_t)GetTickCount64();
+#else
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
 }
 
 /* Re-dial the encoder after the link drops, at most once a second. The output
@@ -383,9 +422,9 @@ static bool obc_reconnect(struct obc_raw *ctx)
 	if (getaddrinfo(ctx->host, ctx->port, &hints, &res) != 0)
 		return false;
 
-	int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+	obc_socket_t fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
 	bool ok = false;
-	if (fd >= 0) {
+	if (fd != OBC_NO_SOCKET) {
 		obc_set_send_timeout(fd);
 		if (connect(fd, res->ai_addr, res->ai_addrlen) == 0
 		    && (!ctx->shdr_valid
@@ -398,7 +437,7 @@ static bool obc_reconnect(struct obc_raw *ctx)
 			blog(LOG_INFO, "[obc-raw] reconnected to %s:%s", ctx->host,
 			     ctx->port);
 		} else {
-			close(fd);
+			obc_close_socket(fd);
 		}
 	}
 	freeaddrinfo(res);
@@ -482,9 +521,9 @@ static bool obc_start(void *data)
 		return false;
 	}
 
-	int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+	obc_socket_t fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
 	if (fd < 0) {
-		blog(LOG_ERROR, "[obc-raw] socket() failed: %s", strerror(errno));
+		blog(LOG_ERROR, "[obc-raw] socket() failed: %s", obc_socket_error_text());
 		freeaddrinfo(res);
 		obs_data_release(settings);
 		return false;
@@ -494,8 +533,8 @@ static bool obc_start(void *data)
 	if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
 		blog(LOG_ERROR,
 		     "[obc-raw] cannot connect to %s:%s: %s (is the encoder listening?)",
-		     host, port, strerror(errno));
-		close(fd);
+		     host, port, obc_socket_error_text());
+		obc_close_socket(fd);
 		freeaddrinfo(res);
 		obs_data_release(settings);
 		return false;
@@ -688,9 +727,9 @@ static void obc_raw_video(void *data, struct video_data *frame)
 		ctx->consecutive_failures++;
 		if (ctx->consecutive_failures >= OBC_MAX_CONSECUTIVE_FAILURES) {
 			ctx->connected = false;
-			if (ctx->fd >= 0) {
-				close(ctx->fd);
-				ctx->fd = -1;
+			if (ctx->fd != OBC_NO_SOCKET) {
+				obc_close_socket(ctx->fd);
+				ctx->fd = OBC_NO_SOCKET;
 			}
 			ctx->consecutive_failures = 0;
 			signal_stop = true;
@@ -751,9 +790,9 @@ static void obc_raw_audio(void *data, struct audio_data *frame)
 		ctx->consecutive_failures++;
 		if (ctx->consecutive_failures >= OBC_MAX_CONSECUTIVE_FAILURES) {
 			ctx->connected = false;
-			if (ctx->fd >= 0) {
-				close(ctx->fd);
-				ctx->fd = -1;
+			if (ctx->fd != OBC_NO_SOCKET) {
+				obc_close_socket(ctx->fd);
+				ctx->fd = OBC_NO_SOCKET;
 			}
 			ctx->consecutive_failures = 0;
 			signal_stop = true;
@@ -1015,6 +1054,11 @@ OBS_MODULE_USE_DEFAULT_LOCALE("open-broadcast-raw-output", "en-US")
 
 bool obs_module_load(void)
 {
+#ifdef _WIN32
+	WSADATA wsa;
+	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+		blog(LOG_ERROR, "[obc-raw] WSAStartup failed");
+#endif
 	obs_register_output(&obc_output_info);
 	obc_menu_action = obc_menu_action_create(
 		"Open Broadcast raw output (start/stop)",
