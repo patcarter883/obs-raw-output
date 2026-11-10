@@ -29,9 +29,22 @@ if(WIN32)
 
   find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
+  # The frontend API header moved to frontend/api in the 32.x tree; accept
+  # either layout so an OBS version bump does not silently lose the include.
+  set(_frontend_api "")
+  foreach(_cand "${OBS_SOURCE_DIR}/frontend/api" "${OBS_SOURCE_DIR}/UI/obs-frontend-api")
+    if(EXISTS "${_cand}/obs-frontend-api.h")
+      set(_frontend_api "${_cand}")
+      break()
+    endif()
+  endforeach()
+  if(NOT _frontend_api)
+    message(FATAL_ERROR "obs-frontend-api.h not found under ${OBS_SOURCE_DIR}")
+  endif()
+
   set(OBS_INCLUDE_DIRS
     "${OBS_SOURCE_DIR}/libobs"
-    "${OBS_SOURCE_DIR}/UI/obs-frontend-api"
+    "${_frontend_api}"
     "${CMAKE_CURRENT_SOURCE_DIR}/ci/windows")
   set(OBS_LINK_LIBS
     "${OBS_LIB_DIR}/obs.lib"

@@ -29,7 +29,9 @@ jobs:
           curl.exe -sSL -o obs-src.tar.gz "https://github.com/obsproject/obs-studio/archive/refs/tags/$env:OBS_VERSION.tar.gz"
           tar -xzf obs-src.tar.gz
           Move-Item "obs-studio-$env:OBS_VERSION" obs-studio
-          Test-Path obs-studio/libobs/obs-module.h | Out-Null
+          if (-not (Test-Path obs-studio/libobs/obs-module.h)) {
+            throw 'obs-module.h missing after extracting the OBS source'
+          }
 
       - name: Fetch OBS dependencies (Qt 6)
         shell: pwsh
