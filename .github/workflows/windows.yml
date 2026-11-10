@@ -52,6 +52,14 @@ jobs:
           Expand-Archive obs-release.zip -DestinationPath obs-release
           Get-ChildItem obs-release/bin/64bit/obs*.dll | Select-Object Name
 
+      # dumpbin and lib live under the MSVC toolset directory, not on the
+      # runner's PATH. Without this the export step fails with the tool
+      # missing rather than with anything about the DLL.
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Generate import libraries
         shell: pwsh
         run: |
@@ -60,7 +68,10 @@ jobs:
           New-Item -ItemType Directory -Force obs-lib | Out-Null
           foreach ($name in @('obs', 'obs-frontend-api')) {
             $dll = "obs-release/bin/64bit/$name.dll"
-            if (-not (Test-Path $dll)) { throw "$dll missing from the OBS release" }
+            if (-not (Test-Path $dll)) {
+              Write-Host "::error::$dll missing from the OBS release"
+              throw "$dll missing from the OBS release"
+            }
             $exports = @(dumpbin /nologo /exports $dll |
               Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$' |
               ForEach-Object { $_.Matches[0].Groups[1].Value })
@@ -68,12 +79,16 @@ jobs:
             # parse missed, and a truncated import library fails at link time
             # with a misleading "unresolved external" instead.
             if ($exports.Count -lt 50) {
-              dumpbin /nologo /exports $dll | Select-Object -First 40 | Write-Host
+              $sample = (dumpbin /nologo /exports $dll | Select-Object -First 40) -join ' | '
+              Write-Host "::error::$($exports.Count) exports parsed from $name.dll; dumpbin said: $sample"
               throw "only $($exports.Count) exports parsed from $dll"
             }
             @("LIBRARY $name.dll", 'EXPORTS') + $exports | Set-Content -Encoding ASCII "$name.def"
             lib /nologo /def:"$name.def" /machine:x64 /out:"obs-lib/$name.lib"
-            if ($LASTEXITCODE -ne 0) { throw "lib failed for $name" }
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::lib failed for $name (exit $LASTEXITCODE)"
+              throw "lib failed for $name"
+            }
             Write-Host "$name: $($exports.Count) exports"
           }
 
