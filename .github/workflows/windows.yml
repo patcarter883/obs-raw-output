@@ -109,10 +109,17 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+          $out = cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
             -DOBS_SOURCE_DIR="$PWD/obs-studio" `
             -DOBS_LIB_DIR="$PWD/obs-lib" `
-            -DCMAKE_PREFIX_PATH="$env:QT_PREFIX"
+            -DCMAKE_PREFIX_PATH="$env:QT_PREFIX" 2>&1
+          $code = $LASTEXITCODE
+          $out | Write-Host
+          if ($code -ne 0) {
+            $tail = ($out | Select-Object -Last 12) -join ' | '
+            Write-Host "::error::configure failed ($code): $tail"
+            exit 1
+          }
 
       - name: Build
         shell: pwsh
