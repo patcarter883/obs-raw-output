@@ -126,7 +126,15 @@ jobs:
 
       - name: Build
         shell: pwsh
-        run: cmake --build build
+        run: |
+          $out = cmake --build build 2>&1
+          $code = $LASTEXITCODE
+          $out | Write-Host
+          if ($code -ne 0) {
+            $tail = ($out | Select-Object -Last 15) -join ' | '
+            Write-Host "::error::build failed ($code): $tail"
+            exit 1
+          }
 
       - name: Check the module's entry points
         shell: python
