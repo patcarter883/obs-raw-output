@@ -55,7 +55,6 @@
 #include <media-io/audio-io.h>
 
 #include <errno.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,6 +77,7 @@ typedef SOCKET obc_socket_t;
 #  include <netdb.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
+#  include <pthread.h>
 #  include <sys/socket.h>
 #  include <sys/time.h>
 #  include <unistd.h>
@@ -86,6 +86,23 @@ typedef int obc_socket_t;
 #  define obc_close_socket close
 #  define OBC_MSG_NOSIGNAL MSG_NOSIGNAL
 #  define obc_interrupted() (errno == EINTR)
+#endif
+
+/* One mutex guards the socket and the audio cursor; OBS drives the video and
+ * audio paths from separate threads. Windows has no pthreads, so the names go
+ * through this shim and a CRITICAL_SECTION backs them there. */
+#ifdef _WIN32
+typedef CRITICAL_SECTION obc_mutex_t;
+static void obc_mutex_init(obc_mutex_t *m) { InitializeCriticalSection(m); }
+static void obc_mutex_destroy(obc_mutex_t *m) { DeleteCriticalSection(m); }
+static void obc_mutex_lock(obc_mutex_t *m) { EnterCriticalSection(m); }
+static void obc_mutex_unlock(obc_mutex_t *m) { LeaveCriticalSection(m); }
+#else
+typedef pthread_mutex_t obc_mutex_t;
+static void obc_mutex_init(obc_mutex_t *m) { pthread_mutex_init(m, NULL); }
+static void obc_mutex_destroy(obc_mutex_t *m) { pthread_mutex_destroy(m); }
+static void obc_mutex_lock(obc_mutex_t *m) { pthread_mutex_lock(m); }
+static void obc_mutex_unlock(obc_mutex_t *m) { pthread_mutex_unlock(m); }
 #endif
 
 #define OBC_MAGIC 0x4F424352u /* 'OBCR' */
@@ -176,7 +193,7 @@ struct obc_raw {
 	uint32_t audio_channels;
 	bool audio_present;
 
-	pthread_mutex_t lock;
+	obc_mutex_t lock;
 };
 
 /* ------------------------------------------------------------------ planing */
@@ -365,7 +382,7 @@ static void *obc_create(obs_data_t *settings, obs_output_t *output)
 	struct obc_raw *ctx = bzalloc(sizeof(struct obc_raw));
 	ctx->output = output;
 	ctx->fd = OBC_NO_SOCKET;
-	pthread_mutex_init(&ctx->lock, NULL);
+	obc_mutex_init(&ctx->lock);
 	UNUSED_PARAMETER(settings);
 	return ctx;
 }
@@ -377,7 +394,7 @@ static void obc_destroy(void *data)
 		obc_close_socket(ctx->fd);
 		ctx->fd = OBC_NO_SOCKET;
 	}
-	pthread_mutex_destroy(&ctx->lock);
+	obc_mutex_destroy(&ctx->lock);
 	bfree(ctx);
 }
 
@@ -386,13 +403,13 @@ static void obc_destroy(void *data)
  * called with ctx->lock held, or OBS deadlocks on shutdown. */
 static void obc_teardown(struct obc_raw *ctx)
 {
-	pthread_mutex_lock(&ctx->lock);
+	obc_mutex_lock(&ctx->lock);
 	if (ctx->fd != OBC_NO_SOCKET) {
 		obc_close_socket(ctx->fd);
 		ctx->fd = OBC_NO_SOCKET;
 	}
 	ctx->connected = false;
-	pthread_mutex_unlock(&ctx->lock);
+	obc_mutex_unlock(&ctx->lock);
 }
 
 static uint64_t obc_now_ms(void)
@@ -645,13 +662,13 @@ static void obc_stop(void *data, uint64_t ts)
 	/* libobs can deliver a single shutdown through more than one path (the
 	 * frontend teardown and module unload both call stop), so make this
 	 * idempotent: report and tear down exactly once per start. */
-	pthread_mutex_lock(&ctx->lock);
+	obc_mutex_lock(&ctx->lock);
 	if (ctx->stopped) {
-		pthread_mutex_unlock(&ctx->lock);
+		obc_mutex_unlock(&ctx->lock);
 		return;
 	}
 	ctx->stopped = true;
-	pthread_mutex_unlock(&ctx->lock);
+	obc_mutex_unlock(&ctx->lock);
 
 	/* Unlocked on purpose: see obc_teardown(). */
 	obc_teardown(ctx);
@@ -662,12 +679,12 @@ static void obc_stop(void *data, uint64_t ts)
 	 * waiting on an event that never came -- OBS hung on exit. */
 	obs_output_end_data_capture(ctx->output);
 
-	pthread_mutex_lock(&ctx->lock);
+	obc_mutex_lock(&ctx->lock);
 	uint64_t sent = ctx->frames_sent;
 	uint64_t dropped = ctx->frames_dropped;
 	uint64_t chunks = ctx->audio_chunks_sent;
 	uint64_t chunks_dropped = ctx->audio_chunks_dropped;
-	pthread_mutex_unlock(&ctx->lock);
+	obc_mutex_unlock(&ctx->lock);
 
 	blog(LOG_INFO,
 	     "[obc-raw] stopped after %llu frames (%llu dropped) and %llu audio "
@@ -680,10 +697,10 @@ static void obc_raw_video(void *data, struct video_data *frame)
 {
 	struct obc_raw *ctx = data;
 
-	pthread_mutex_lock(&ctx->lock);
+	obc_mutex_lock(&ctx->lock);
 	if (!ctx->connected || ctx->fd < 0) {
 		if (!obc_reconnect(ctx)) {
-			pthread_mutex_unlock(&ctx->lock);
+			obc_mutex_unlock(&ctx->lock);
 			return;
 		}
 	}
@@ -738,7 +755,7 @@ static void obc_raw_video(void *data, struct video_data *frame)
 		}
 	}
 
-	pthread_mutex_unlock(&ctx->lock);
+	obc_mutex_unlock(&ctx->lock);
 
 	/* Signalled outside the lock: the stop path takes this same lock, so
 	 * calling it while held would deadlock the video thread. */
@@ -759,10 +776,10 @@ static void obc_raw_audio(void *data, struct audio_data *frame)
 {
 	struct obc_raw *ctx = data;
 
-	pthread_mutex_lock(&ctx->lock);
+	obc_mutex_lock(&ctx->lock);
 	if (!ctx->connected || ctx->fd < 0 || !ctx->audio_present ||
 	    frame->frames == 0 || ctx->audio_channels == 0) {
-		pthread_mutex_unlock(&ctx->lock);
+		obc_mutex_unlock(&ctx->lock);
 		return;
 	}
 
@@ -801,7 +818,7 @@ static void obc_raw_audio(void *data, struct audio_data *frame)
 		}
 	}
 
-	pthread_mutex_unlock(&ctx->lock);
+	obc_mutex_unlock(&ctx->lock);
 
 	if (signal_stop) {
 		blog(LOG_WARNING,
@@ -813,9 +830,9 @@ static uint64_t obc_get_total_bytes(void *data)
 {
 	struct obc_raw *ctx = data;
 	uint64_t bytes;
-	pthread_mutex_lock(&ctx->lock);
+	obc_mutex_lock(&ctx->lock);
 	bytes = ctx->bytes_sent;
-	pthread_mutex_unlock(&ctx->lock);
+	obc_mutex_unlock(&ctx->lock);
 	return bytes;
 }
 
@@ -823,11 +840,11 @@ static int obc_get_dropped_frames(void *data)
 {
 	struct obc_raw *ctx = data;
 	int dropped;
-	pthread_mutex_lock(&ctx->lock);
+	obc_mutex_lock(&ctx->lock);
 	/* OBS shows this number as "dropped frames"; audio drops are invisible
 	 * otherwise, so count them too. */
 	dropped = (int)(ctx->frames_dropped + ctx->audio_chunks_dropped);
-	pthread_mutex_unlock(&ctx->lock);
+	obc_mutex_unlock(&ctx->lock);
 	return dropped;
 }
 
