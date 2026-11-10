@@ -64,43 +64,37 @@ jobs:
         shell: pwsh
         run: |
           # Resolve the tools explicitly rather than trusting PATH, and report
-          # any failure as an annotation: the log download needs repository
+          # every stage as an annotation: the log download needs repository
           # admin rights, so annotations are the only readable channel.
           $ErrorActionPreference = 'Stop'
+          Write-Host "::warning::export step starting"
           try {
-            $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)?.Source
-            $lib = (Get-Command lib.exe -ErrorAction SilentlyContinue)?.Source
-            if (-not $dumpbin -or -not $lib) {
-              $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-              if (Test-Path $vswhere) {
-                $vs = & $vswhere -latest -products * `
-                  -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-                  -property installationPath
-                $toolset = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory |
-                  Sort-Object Name -Descending | Select-Object -First 1
-                $host = "$($toolset.FullName)\bin\Hostx64\x64"
-                if (-not $dumpbin) { $dumpbin = "$host\dumpbin.exe" }
-                if (-not $lib) { $lib = "$host\lib.exe" }
-              }
+            $dumpbin = ''
+            $libexe = ''
+            $found = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+            if ($found) { $dumpbin = $found.Source }
+            $foundLib = Get-Command lib.exe -ErrorAction SilentlyContinue
+            if ($foundLib) { $libexe = $foundLib.Source }
+
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            Write-Host "::warning::on PATH: dumpbin='$dumpbin' lib='$libexe' vswhere=$(Test-Path $vswhere)"
+            if (-not $dumpbin -or -not $libexe) {
+              $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+              $toolset = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+              $binDir = Join-Path $toolset.FullName 'bin\Hostx64\x64'
+              if (-not $dumpbin) { $dumpbin = Join-Path $binDir 'dumpbin.exe' }
+              if (-not $libexe) { $libexe = Join-Path $binDir 'lib.exe' }
             }
-            foreach ($t in @($dumpbin, $lib)) {
-              if (-not $t -or -not (Test-Path $t)) {
-                Write-Host "::error::tool not found: $t"
-                throw "tool not found: $t"
-              }
-            }
-            Write-Host "dumpbin: $dumpbin"
-            Write-Host "lib:     $lib"
+            Write-Host "::warning::using dumpbin='$dumpbin' ($(Test-Path $dumpbin)) lib='$libexe' ($(Test-Path $libexe))"
+            if (-not (Test-Path $dumpbin)) { throw "dumpbin not found at '$dumpbin'" }
+            if (-not (Test-Path $libexe)) { throw "lib not found at '$libexe'" }
 
             # The release ships DLLs, not .lib files. dumpbin lists the exports;
             # lib turns that list into the import library the linker needs.
             New-Item -ItemType Directory -Force obs-lib | Out-Null
             foreach ($name in @('obs', 'obs-frontend-api')) {
               $dll = "obs-release/bin/64bit/$name.dll"
-              if (-not (Test-Path $dll)) {
-                Write-Host "::error::$dll missing from the OBS release"
-                throw "$dll missing from the OBS release"
-              }
+              if (-not (Test-Path $dll)) { throw "$dll missing from the OBS release" }
               $exports = @(& $dumpbin /nologo /exports $dll |
                 Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$' |
                 ForEach-Object { $_.Matches[0].Groups[1].Value })
@@ -109,17 +103,14 @@ jobs:
               # with a misleading "unresolved external" instead.
               if ($exports.Count -lt 50) {
                 $sample = (& $dumpbin /nologo /exports $dll | Select-Object -First 20) -join ' | '
-                Write-Host "::error::$($exports.Count) exports parsed from $name.dll; first lines: $sample"
-                throw "only $($exports.Count) exports parsed from $dll"
+                throw "only $($exports.Count) exports parsed from $dll; first lines: $sample"
               }
               @("LIBRARY $name.dll", 'EXPORTS') + $exports | Set-Content -Encoding ASCII "$name.def"
-              & $lib /nologo /def:"$name.def" /machine:x64 /out:"obs-lib/$name.lib"
-              if ($LASTEXITCODE -ne 0) {
-                Write-Host "::error::lib failed for $name (exit $LASTEXITCODE)"
-                throw "lib failed for $name"
-              }
+              & $libexe /nologo /def:"$name.def" /machine:x64 /out:"obs-lib/$name.lib"
+              if ($LASTEXITCODE -ne 0) { throw "lib failed for $name (exit $LASTEXITCODE)" }
               Write-Host "$name: $($exports.Count) exports"
             }
+            Write-Host "::warning::export step completed"
           } catch {
             Write-Host "::error::$($_.Exception.Message)"
             exit 1
