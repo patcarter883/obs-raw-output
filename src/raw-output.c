@@ -279,10 +279,12 @@ static void obc_set_send_timeout(obc_socket_t fd)
 #endif
 
 	int sndbuf = OBC_SNDBUF_BYTES;
-	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf,
+		   sizeof(sndbuf));
 
 	int one = 1;
-	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one,
+		   sizeof(one));
 }
 
 static bool obc_send_all(obc_socket_t fd, const void *buf, size_t len)
