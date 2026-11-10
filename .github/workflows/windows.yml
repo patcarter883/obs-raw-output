@@ -1,0 +1,117 @@
+name: windows
+
+# The plugin's settings dialog and menu action are Qt, and OBS on Windows is an
+# MSVC build shipping its own MSVC Qt. A MinGW-built Qt in the same process as
+# OBS's is two C++ ABIs sharing Qt types, so this build must be MSVC -- which
+# means it runs here rather than on the Linux dev box.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      OBS_VERSION: 32.2.2
+      # OBS 32.2.2 was released 2026-08-14; its dependencies are the set
+      # published before that date. The Qt here must match OBS's own, or the
+      # plugin links against a Qt the host process does not have.
+      OBS_DEPS_VERSION: 2026-07-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch OBS source headers
+        shell: pwsh
+        run: |
+          curl.exe -sSL -o obs-src.tar.gz "https://github.com/obsproject/obs-studio/archive/refs/tags/$env:OBS_VERSION.tar.gz"
+          tar -xzf obs-src.tar.gz
+          Move-Item "obs-studio-$env:OBS_VERSION" obs-studio
+          Test-Path obs-studio/libobs/obs-module.h | Out-Null
+
+      - name: Fetch OBS dependencies (Qt 6)
+        shell: pwsh
+        run: |
+          curl.exe -sSL -o deps-qt6.zip "https://github.com/obsproject/obs-deps/releases/download/$env:OBS_DEPS_VERSION/windows-deps-qt6-$env:OBS_DEPS_VERSION-x64.zip"
+          Expand-Archive deps-qt6.zip -DestinationPath deps
+          # Layout varies by release, so locate the CMake config rather than
+          # assuming a path.
+          $qt = Get-ChildItem -Path deps -Recurse -Directory -Filter Qt6 |
+                 Where-Object { $_.FullName -like '*\lib\cmake\Qt6' } |
+                 Select-Object -First 1
+          if (-not $qt) { Get-ChildItem deps | Out-String | Write-Host; throw 'Qt6 CMake config not found in obs-deps' }
+          $prefix = Split-Path (Split-Path (Split-Path $qt.FullName))
+          "QT_PREFIX=$prefix" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Fetch OBS release binaries
+        shell: pwsh
+        run: |
+          curl.exe -sSL -o obs-release.zip "https://github.com/obsproject/obs-studio/releases/download/$env:OBS_VERSION/OBS-Studio-$env:OBS_VERSION-Windows-x64.zip"
+          Expand-Archive obs-release.zip -DestinationPath obs-release
+          Get-ChildItem obs-release/bin/64bit/obs*.dll | Select-Object Name
+
+      - name: Generate import libraries
+        shell: pwsh
+        run: |
+          # The release ships DLLs, not .lib files. dumpbin lists the exports;
+          # lib turns that list into the import library the linker needs.
+          New-Item -ItemType Directory -Force obs-lib | Out-Null
+          foreach ($name in @('obs', 'obs-frontend-api')) {
+            $dll = "obs-release/bin/64bit/$name.dll"
+            if (-not (Test-Path $dll)) { throw "$dll missing from the OBS release" }
+            $exports = @(dumpbin /nologo /exports $dll |
+              Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value })
+            # obs.dll exports well over a thousand symbols; a handful means the
+            # parse missed, and a truncated import library fails at link time
+            # with a misleading "unresolved external" instead.
+            if ($exports.Count -lt 50) {
+              dumpbin /nologo /exports $dll | Select-Object -First 40 | Write-Host
+              throw "only $($exports.Count) exports parsed from $dll"
+            }
+            @("LIBRARY $name.dll", 'EXPORTS') + $exports | Set-Content -Encoding ASCII "$name.def"
+            lib /nologo /def:"$name.def" /machine:x64 /out:"obs-lib/$name.lib"
+            if ($LASTEXITCODE -ne 0) { throw "lib failed for $name" }
+            Write-Host "$name: $($exports.Count) exports"
+          }
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DOBS_SOURCE_DIR="$PWD/obs-studio" `
+            -DOBS_LIB_DIR="$PWD/obs-lib" `
+            -DCMAKE_PREFIX_PATH="$env:QT_PREFIX"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Check the module's entry points
+        shell: pwsh
+        run: |
+          $dll = 'build/Release/open-broadcast-raw-output.dll'
+          if (-not (Test-Path $dll)) { throw "$dll was not produced" }
+          $exports = dumpbin /nologo /exports $dll
+          foreach ($symbol in @('obs_module_load', 'obs_module_unload')) {
+            if (-not ($exports | Select-String $symbol)) { throw "$dll does not export $symbol" }
+          }
+          Get-Item $dll | Select-Object Name, Length
+
+      - name: Package
+        shell: pwsh
+        run: |
+          # The layout OBS scans under %ProgramData%\obs-studio\plugins.
+          New-Item -ItemType Directory -Force package/obs-plugins/64bit | Out-Null
+          Copy-Item build/Release/open-broadcast-raw-output.dll package/obs-plugins/64bit/
+          if (Test-Path data) { Copy-Item data -Destination package/ -Recurse }
+          Compress-Archive -Path package/* -DestinationPath open-broadcast-raw-output-win64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: open-broadcast-raw-output-win64
+          path: |
+            open-broadcast-raw-output-win64.zip
+            build/Release/open-broadcast-raw-output.dll
