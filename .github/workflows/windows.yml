@@ -60,57 +60,47 @@ jobs:
         with:
           arch: x64
 
+      # The OBS release ships DLLs, not .lib files. Read the export table
+      # straight from the PE headers -- that part is testable off Windows, and
+      # leaves only lib.exe as something the runner has to provide.
+      - name: Generate module definition files
+        shell: python
+        run: |
+          import subprocess, sys
+          for name in ('obs', 'obs-frontend-api'):
+              subprocess.run(
+                  [sys.executable, 'ci/windows/gen_def.py',
+                   f'obs-release/bin/64bit/{name}.dll', f'{name}.def',
+                   '--min-exports', '50'],
+                  check=True,
+              )
+
       - name: Generate import libraries
         shell: pwsh
         run: |
-          # Resolve the tools explicitly rather than trusting PATH, and report
-          # every stage as an annotation: the log download needs repository
-          # admin rights, so annotations are the only readable channel.
           $ErrorActionPreference = 'Stop'
-          Write-Host "::warning::export step starting"
+          Write-Host "::warning::resolving lib.exe"
           try {
-            $dumpbin = ''
             $libexe = ''
-            $found = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
-            if ($found) { $dumpbin = $found.Source }
-            $foundLib = Get-Command lib.exe -ErrorAction SilentlyContinue
-            if ($foundLib) { $libexe = $foundLib.Source }
-
-            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-            Write-Host "::warning::on PATH: dumpbin='$dumpbin' lib='$libexe' vswhere=$(Test-Path $vswhere)"
-            if (-not $dumpbin -or -not $libexe) {
+            $found = Get-Command lib.exe -ErrorAction SilentlyContinue
+            if ($found) { $libexe = $found.Source }
+            if (-not $libexe) {
+              $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+              Write-Host "::warning::vswhere present: $(Test-Path $vswhere)"
               $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
               $toolset = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-              $binDir = Join-Path $toolset.FullName 'bin\Hostx64\x64'
-              if (-not $dumpbin) { $dumpbin = Join-Path $binDir 'dumpbin.exe' }
-              if (-not $libexe) { $libexe = Join-Path $binDir 'lib.exe' }
+              $libexe = Join-Path (Join-Path $toolset.FullName 'bin\Hostx64\x64') 'lib.exe'
             }
-            Write-Host "::warning::using dumpbin='$dumpbin' ($(Test-Path $dumpbin)) lib='$libexe' ($(Test-Path $libexe))"
-            if (-not (Test-Path $dumpbin)) { throw "dumpbin not found at '$dumpbin'" }
-            if (-not (Test-Path $libexe)) { throw "lib not found at '$libexe'" }
+            Write-Host "::warning::lib.exe='$libexe' present: $(Test-Path $libexe)"
+            if (-not (Test-Path $libexe)) { throw "lib.exe not found at '$libexe'" }
 
-            # The release ships DLLs, not .lib files. dumpbin lists the exports;
-            # lib turns that list into the import library the linker needs.
             New-Item -ItemType Directory -Force obs-lib | Out-Null
             foreach ($name in @('obs', 'obs-frontend-api')) {
-              $dll = "obs-release/bin/64bit/$name.dll"
-              if (-not (Test-Path $dll)) { throw "$dll missing from the OBS release" }
-              $exports = @(& $dumpbin /nologo /exports $dll |
-                Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$' |
-                ForEach-Object { $_.Matches[0].Groups[1].Value })
-              # obs.dll exports well over a thousand symbols; a handful means the
-              # parse missed, and a truncated import library fails at link time
-              # with a misleading "unresolved external" instead.
-              if ($exports.Count -lt 50) {
-                $sample = (& $dumpbin /nologo /exports $dll | Select-Object -First 20) -join ' | '
-                throw "only $($exports.Count) exports parsed from $dll; first lines: $sample"
-              }
-              @("LIBRARY $name.dll", 'EXPORTS') + $exports | Set-Content -Encoding ASCII "$name.def"
               & $libexe /nologo /def:"$name.def" /machine:x64 /out:"obs-lib/$name.lib"
               if ($LASTEXITCODE -ne 0) { throw "lib failed for $name (exit $LASTEXITCODE)" }
-              Write-Host "$name: $($exports.Count) exports"
+              if (-not (Test-Path "obs-lib/$name.lib")) { throw "obs-lib/$name.lib was not produced" }
             }
-            Write-Host "::warning::export step completed"
+            Write-Host "::warning::import libraries built"
           } catch {
             Write-Host "::error::$($_.Exception.Message)"
             exit 1
@@ -129,15 +119,16 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Check the module's entry points
-        shell: pwsh
+        shell: python
         run: |
-          $dll = 'build/Release/open-broadcast-raw-output.dll'
-          if (-not (Test-Path $dll)) { throw "$dll was not produced" }
-          $exports = dumpbin /nologo /exports $dll
-          foreach ($symbol in @('obs_module_load', 'obs_module_unload')) {
-            if (-not ($exports | Select-String $symbol)) { throw "$dll does not export $symbol" }
-          }
-          Get-Item $dll | Select-Object Name, Length
+          import sys
+          sys.path.insert(0, 'ci/windows')
+          from gen_def import exported_names
+          names = set(exported_names('build/Release/open-broadcast-raw-output.dll'))
+          missing = {'obs_module_load', 'obs_module_unload'} - names
+          if missing:
+              raise SystemExit(f'entry points missing from the DLL: {sorted(missing)}')
+          print(f'{len(names)} exports, both entry points present')
 
       - name: Package
         shell: pwsh
