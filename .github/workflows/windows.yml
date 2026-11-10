@@ -109,7 +109,10 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
-          $out = cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+          # Ninja against the MSVC environment rather than the "Visual Studio
+          # 17 2022" generator: the runner image has no VS instance for CMake to
+          # find, but msvc-dev-cmd has already put cl.exe on PATH.
+          $out = cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DOBS_SOURCE_DIR="$PWD/obs-studio" `
             -DOBS_LIB_DIR="$PWD/obs-lib" `
             -DCMAKE_PREFIX_PATH="$env:QT_PREFIX" 2>&1
@@ -123,7 +126,7 @@ jobs:
 
       - name: Build
         shell: pwsh
-        run: cmake --build build --config Release
+        run: cmake --build build
 
       - name: Check the module's entry points
         shell: python
@@ -131,7 +134,7 @@ jobs:
           import sys
           sys.path.insert(0, 'ci/windows')
           from gen_def import exported_names
-          names = set(exported_names('build/Release/open-broadcast-raw-output.dll'))
+          names = set(exported_names('build/open-broadcast-raw-output.dll'))
           missing = {'obs_module_load', 'obs_module_unload'} - names
           if missing:
               raise SystemExit(f'entry points missing from the DLL: {sorted(missing)}')
@@ -142,7 +145,7 @@ jobs:
         run: |
           # The layout OBS scans under %ProgramData%\obs-studio\plugins.
           New-Item -ItemType Directory -Force package/obs-plugins/64bit | Out-Null
-          Copy-Item build/Release/open-broadcast-raw-output.dll package/obs-plugins/64bit/
+          Copy-Item build/open-broadcast-raw-output.dll package/obs-plugins/64bit/
           if (Test-Path data) { Copy-Item data -Destination package/ -Recurse }
           Compress-Archive -Path package/* -DestinationPath open-broadcast-raw-output-win64.zip
 
@@ -151,4 +154,4 @@ jobs:
           name: open-broadcast-raw-output-win64
           path: |
             open-broadcast-raw-output-win64.zip
-            build/Release/open-broadcast-raw-output.dll
+            build/open-broadcast-raw-output.dll
