@@ -101,9 +101,11 @@ set_target_properties(open-broadcast-raw-output PROPERTIES
 
 if(WIN32)
   # A Windows OBS scans %ProgramData%\obs-studio\plugins, so the package is the
-  # plugin's own tree: obs-plugins/64bit + data.
+  # plugin's own tree: obs-plugins/64bit + data. A MODULE target is a DLL here,
+  # but CMake still wants LIBRARY named for module targets, so both are given.
   install(TARGETS open-broadcast-raw-output
-    RUNTIME DESTINATION "obs-plugins/64bit")
+    RUNTIME DESTINATION "obs-plugins/64bit"
+    LIBRARY DESTINATION "obs-plugins/64bit")
   install(DIRECTORY data/
     DESTINATION "data"
     OPTIONAL)
