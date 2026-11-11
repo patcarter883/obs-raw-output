@@ -1,14 +1,32 @@
 name: windows
 
+# Builds the plugin with MSVC on Windows, packages it, and -- on a v* tag --
+# publishes the package as a GitHub Release.
+#
 # The plugin's settings dialog and menu action are Qt, and OBS on Windows is an
 # MSVC build shipping its own MSVC Qt. A MinGW-built Qt in the same process as
 # OBS's is two C++ ABIs sharing Qt types, so this build must be MSVC -- which
 # means it runs here rather than on the Linux dev box.
+#
+# Every run uploads the packaged zip as a workflow artifact. A push of a v* tag
+# additionally attaches that zip plus its SHA-256 to a release; branch and
+# pull-request runs only build and test.
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+
+permissions:
+  # The release step creates and populates a release, which is a write to the
+  # repository's contents. Reads are all branch and pull-request runs need.
+  contents: write
+
+concurrency:
+  # Branch builds supersede each other. A tag build never cancels a running
+  # release publish, so a re-pushed tag cannot leave a half-populated release.
+  group: windows-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
   build:
@@ -150,18 +168,61 @@ jobs:
               raise SystemExit(f'entry points missing from the DLL: {sorted(missing)}')
           print(f'{len(names)} exports, both entry points present')
 
+      # Assembled from the CMake install rules rather than by copying files, so
+      # the zip is whatever `install` declares: the DLL at obs-plugins/64bit and,
+      # when the repo has one, the data tree at data/. That is the tree OBS scans
+      # under %ProgramData%\obs-studio\plugins.
       - name: Package
+        id: package
         shell: pwsh
         run: |
-          # The layout OBS scans under %ProgramData%\obs-studio\plugins.
-          New-Item -ItemType Directory -Force package/obs-plugins/64bit | Out-Null
-          Copy-Item build/open-broadcast-raw-output.dll package/obs-plugins/64bit/
-          if (Test-Path data) { Copy-Item data -Destination package/ -Recurse }
-          Compress-Archive -Path package/* -DestinationPath open-broadcast-raw-output-win64.zip
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $PWD 'package'
+          $out = cmake --install build --prefix $package 2>&1
+          $out | Write-Host
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::cmake --install failed'; exit 1 }
+
+          $dll = Join-Path $package 'obs-plugins/64bit/open-broadcast-raw-output.dll'
+          if (-not (Test-Path $dll)) { throw "install did not place the DLL at $dll" }
+          if (Test-Path (Join-Path $package 'data')) {
+            Write-Host '::notice::data/ included from the install rules'
+          }
+
+          # A tag names the download after itself; anything else is a snapshot.
+          $ver = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME } else { 'snapshot' }
+          $zip = "open-broadcast-raw-output-$ver-win64.zip"
+          Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip
+
+          # The hash ships beside the zip so a download can be checked against
+          # the release without trusting the transfer.
+          $sha = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
+          "$sha  $zip" | Out-File -Encoding ascii -NoNewline "$zip.sha256"
+
+          $size = (Get-Item $zip).Length
+          $entries = (Get-ChildItem -Path $package -Recurse -File | ForEach-Object {
+            $_.FullName.Substring($package.Length + 1) -replace '\\', '/'
+          }) -join ', '
+          Write-Host "::notice::$zip ($size bytes) sha256 $sha; entries: $entries"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "zip=$zip"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sha256=$sha"
 
       - uses: actions/upload-artifact@v4
         with:
           name: open-broadcast-raw-output-win64
           path: |
-            open-broadcast-raw-output-win64.zip
+            open-broadcast-raw-output-*-win64.zip
+            open-broadcast-raw-output-*-win64.zip.sha256
             build/open-broadcast-raw-output.dll
+
+      # Releases exist for tags only: a branch run publishes nothing, so the
+      # artifact from the step above is the whole downloadable output there.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.zip }}.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
