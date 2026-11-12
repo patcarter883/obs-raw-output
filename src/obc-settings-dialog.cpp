@@ -15,6 +15,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFormLayout>
+#include <QLabel>
 #include <QLineEdit>
 #include <QString>
 #include <QWidget>
@@ -37,6 +38,14 @@ public:
 		target_edit_ = new QLineEdit(target, this);
 		target_edit_->setPlaceholderText("host:port");
 		form->addRow("Target (the encoder listens here)", target_edit_);
+
+		auto *hint = new QLabel(
+			"The encoder also starts and stops this output, on the port "
+			"above the target. The Tools menu stays the manual "
+			"override.",
+			this);
+		hint->setWordWrap(true);
+		form->addRow(QString(), hint);
 
 		audio_box_ = new QCheckBox(
 			"Send audio, synchronised with the video", this);
