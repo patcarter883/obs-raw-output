@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * Copyright (C) 2026 Pat Carter
+ */
 #include <obs-frontend-api.h>
 #include <QAction>
 #include <QMetaObject>
