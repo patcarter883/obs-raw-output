@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * Copyright (C) 2026 Pat Carter
+ */
 /*
  * open-broadcast-raw-output
  *
@@ -145,8 +148,16 @@ static void obc_thread_join(obc_thread_t t) { pthread_join(t, NULL); }
 #define OBC_AUDIO_F32_PLANAR 1u
 #define OBC_SEND_TIMEOUT_MS 200
 #define OBC_SNDBUF_BYTES (8 * 1024 * 1024)
-/* ~1.5 s at 60 fps. After the peer goes away (encoder stopped or restarted) the
- * output stops itself instead of spinning forever dropping every frame. */
+
+/* Set by CMake from project(VERSION); present so a standalone compile still
+ * builds and says so rather than inventing a number. */
+#ifndef OBC_PLUGIN_VERSION
+#  define OBC_PLUGIN_VERSION "unknown"
+#endif
+
+/* ~1.5 s at 60 fps. Reaching this closes the socket and marks the stream
+ * disconnected; the next video callback re-dials, so an encoder restart costs a
+ * second of frames rather than the operator's output. */
 #define OBC_MAX_CONSECUTIVE_FAILURES 90
 
 struct obc_stream_header {
@@ -1472,7 +1483,8 @@ bool obs_module_load(void)
 	obc_control_start_thread();
 
 	blog(LOG_INFO,
-	     "[obc-raw] loaded: uncompressed frame output registered as 'obc_raw_output'");
+	     "[obc-raw] loaded v%s: uncompressed frame output registered as 'obc_raw_output'",
+	     OBC_PLUGIN_VERSION);
 	return true;
 }
 

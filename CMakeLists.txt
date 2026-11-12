@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(open-broadcast-raw-output C CXX)
+project(open-broadcast-raw-output VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -98,6 +98,12 @@ target_include_directories(open-broadcast-raw-output SYSTEM PRIVATE
   ${OBS_INCLUDE_DIRS})
 
 target_link_libraries(open-broadcast-raw-output PRIVATE ${OBS_LINK_LIBS})
+
+# One definition of the plugin's version, taken from the project() above, and
+# reported at load time: OBS's log is where a support question starts, and the
+# version has to be readable without inspecting the binary.
+target_compile_definitions(open-broadcast-raw-output PRIVATE
+  OBC_PLUGIN_VERSION="${PROJECT_VERSION}")
 
 if(MSVC)
   target_compile_options(open-broadcast-raw-output PRIVATE /W3)

@@ -24,7 +24,9 @@ No encoding, no muxing, no container. At 1080p60 NV12 a frame is **3,110,400 byt
 ## Build and install
 
 Requires the libobs and obs-frontend-api dev headers (`pkg-config libobs obs-frontend-api`) plus Qt6 Widgets.
-Present on the reference host with OBS Studio 32.2.2, cmake ≥ 3.28 and a C++17 compiler.
+Present on the reference host with OBS Studio 33.0.1 (32.2.2 before that), cmake ≥ 3.28 and a C++17
+compiler. The headers and libraries come from the OBS version you build against — that is the OBS the
+resulting plugin loads into.
 
 ```sh
 cmake -S . -B build -D CMAKE_BUILD_TYPE=Release
@@ -295,8 +297,26 @@ OBC_RAW_AUTOSTART=1 OBC_RAW_TARGET=127.0.0.1:9300 obs --disable-shutdown-check
 
 ## Status
 
-- **Phase 0: done.** Uncompressed video **and synchronised audio** leave OBS and arrive intact, proven on
-  this host (A/V offset under 1 ms, drift under 1 ms over ~20 s, zero dropped frames/chunks).
-- **Phase 1:** the encoder grows `input_mode::raw_local`, which listens on the default port and pushes the
-  frames into its GStreamer pipeline via `appsrc` — so the encode stage runs exactly once, in the encoder. The
-  encoder's `raw_local_input::default_port` is `9300`, matching the plugin default.
+**v1.0.0.** Proven on the reference host against **OBS 33.0.1** (and 32.2.2 before that), cmake ≥ 3.28:
+
+- Uncompressed video **and synchronised audio** leave OBS and arrive intact (A/V offset under 1 ms, drift
+  under 1 ms over ~20 s, zero dropped frames/chunks in the reference runs).
+- The encoder's `input_mode::raw_local` listens on `9300` and feeds the frames into its GStreamer pipeline,
+  so the encode stage runs exactly once, in the encoder.
+- The encoder **starts and stops this output** over the control channel; verified in both directions, with
+  the stop judged by the frame socket going silent (byte count unchanged afterwards), not by a log line.
+
+**Versioning.** This is a binary artefact **per OBS major**: it links `libobs` and `obs-frontend-api`
+directly, so a plugin built for one major does not load into the next. Release notes name the OBS version
+each artefact was built against, and each new OBS major means a rebuild.
+
+## Licence
+
+**GPL-2.0-or-later** — see `LICENSE`.
+
+The plugin links libobs, which is GPL-2.0-or-later, so this component is GPL even though the rest of the
+open-broadcast stack (encoder, receiver, backplane) is AGPL-3.0-or-later. They are separate programs: the
+plugin and the encoder are joined by a socket and a port, never linked into one binary.
+
+The frames leave OBS uncompressed precisely so nothing here practises a codec — OBS hands over pixels, and
+the encoder performs the single encode.
