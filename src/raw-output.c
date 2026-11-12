@@ -74,10 +74,12 @@ typedef SOCKET obc_socket_t;
 #  define obc_interrupted() false
 #else
 #  include <arpa/inet.h>
+#  include <fcntl.h>
 #  include <netdb.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <pthread.h>
+#  include <sys/select.h>
 #  include <sys/socket.h>
 #  include <sys/time.h>
 #  include <unistd.h>
@@ -103,6 +105,31 @@ static void obc_mutex_init(obc_mutex_t *m) { pthread_mutex_init(m, NULL); }
 static void obc_mutex_destroy(obc_mutex_t *m) { pthread_mutex_destroy(m); }
 static void obc_mutex_lock(obc_mutex_t *m) { pthread_mutex_lock(m); }
 static void obc_mutex_unlock(obc_mutex_t *m) { pthread_mutex_unlock(m); }
+#endif
+
+/* One thread watches the encoder's control port, so the thread handle needs the
+ * same treatment: CreateThread on Windows, pthreads elsewhere. */
+#ifdef _WIN32
+typedef HANDLE obc_thread_t;
+typedef DWORD(WINAPI *obc_thread_fn_t)(LPVOID);
+static bool obc_thread_start(obc_thread_t *t, obc_thread_fn_t fn, void *arg)
+{
+	*t = CreateThread(NULL, 0, fn, arg, 0, NULL);
+	return *t != NULL;
+}
+static void obc_thread_join(obc_thread_t t)
+{
+	WaitForSingleObject(t, INFINITE);
+	CloseHandle(t);
+}
+#else
+typedef pthread_t obc_thread_t;
+typedef void *(*obc_thread_fn_t)(void *);
+static bool obc_thread_start(obc_thread_t *t, obc_thread_fn_t fn, void *arg)
+{
+	return pthread_create(t, NULL, fn, arg) == 0;
+}
+static void obc_thread_join(obc_thread_t t) { pthread_join(t, NULL); }
 #endif
 
 #define OBC_MAGIC 0x4F424352u /* 'OBCR' */
@@ -302,6 +329,66 @@ static void obc_set_send_timeout(obc_socket_t fd)
 	int one = 1;
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one,
 		   sizeof(one));
+}
+
+/* A receive timeout turns an idle control channel into a loop iteration
+ * instead of a parked thread, which is what lets shutdown be prompt. */
+static void obc_set_recv_timeout(obc_socket_t fd, int ms)
+{
+#ifdef _WIN32
+	DWORD window = (DWORD)ms;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&window,
+		   sizeof(window));
+#else
+	struct timeval tv;
+	tv.tv_sec = ms / 1000;
+	tv.tv_usec = (ms % 1000) * 1000;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+static void obc_set_nonblocking(obc_socket_t fd, bool on)
+{
+#ifdef _WIN32
+	u_long mode = on ? 1 : 0;
+	ioctlsocket(fd, FIONBIO, &mode);
+#else
+	int flags = fcntl(fd, F_GETFL, 0);
+	if (flags < 0)
+		return;
+	fcntl(fd, F_SETFL, on ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
+#endif
+}
+
+static int obc_socket_error(void)
+{
+#ifdef _WIN32
+	return WSAGetLastError();
+#else
+	return errno;
+#endif
+}
+
+/* errno/EAGAIN equivalents: a non-blocking operation that needs to wait, and a
+ * timeout that is a poll interval rather than a failure. */
+static bool obc_in_progress(void)
+{
+#ifdef _WIN32
+	const int err = WSAGetLastError();
+	return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS;
+#else
+	return errno == EINPROGRESS;
+#endif
+}
+
+static bool obc_would_block(void)
+{
+#ifdef _WIN32
+	const int err = WSAGetLastError();
+	return err == WSAEWOULDBLOCK || err == WSAETIMEDOUT;
+#else
+	return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
 }
 
 static bool obc_send_all(obc_socket_t fd, const void *buf, size_t len)
@@ -984,14 +1071,303 @@ static void obc_start_output(void)
 	}
 }
 
+static void obc_stop_output(void)
+{
+	if (obc_menu_output && obs_output_active(obc_menu_output))
+		obs_output_stop(obc_menu_output);
+}
+
 static void obc_menu_action_toggled(bool checked)
 {
 	if (checked) {
 		obc_start_output();
 		return;
 	}
-	if (obc_menu_output && obs_output_active(obc_menu_output))
-		obs_output_stop(obc_menu_output);
+	obc_stop_output();
+}
+
+/* ------------------------------------------------------- encoder control */
+
+/* The encoder says when to run. It opens a control port beside its frame
+ * listener (frame port + 1, derived the same way on both sides) and writes one
+ * word per line: `start` while it is previewing or encoding, `stop` when that
+ * ends. So the operator starts the stream in the encoder and this output comes
+ * with it, instead of holding a Tools toggle in step with it -- forgetting that
+ * toggle looked exactly like a broken encoder.
+ *
+ * The channel only ever asks for a transition; it never drives the output
+ * itself. Both land on the UI thread through obs_queue_task, which is where
+ * every other start/stop here runs, and it is stopped before the frontend goes
+ * away so no task is queued into a dead UI.
+ *
+ * A lost channel is not a stop: the encoder restarts routinely, so this thread
+ * re-dials and the ingest's own reconnect covers the frames. The Tools toggle
+ * stays as the manual override.
+ */
+#define OBC_CONTROL_RETRY_MS 1000
+#define OBC_CONTROL_RECV_TIMEOUT_MS 500
+#define OBC_CONTROL_CONNECT_WAIT_MS 1000
+
+static obc_mutex_t obc_control_lock;
+static bool obc_control_stop = true;
+static obc_thread_t obc_control_thread;
+static bool obc_control_thread_started = false;
+
+static bool obc_control_stopping(void)
+{
+	bool stopping;
+	obc_mutex_lock(&obc_control_lock);
+	stopping = obc_control_stop;
+	obc_mutex_unlock(&obc_control_lock);
+	return stopping;
+}
+
+/* Sleeps in slices so a stop request is honoured promptly. */
+static void obc_control_pause(int ms)
+{
+	int waited = 0;
+	while (waited < ms && !obc_control_stopping()) {
+		os_sleep_ms(50);
+		waited += 50;
+	}
+}
+
+static void obc_control_apply_start(void *param)
+{
+	UNUSED_PARAMETER(param);
+	obc_start_output();
+}
+
+static void obc_control_apply_stop(void *param)
+{
+	UNUSED_PARAMETER(param);
+	obc_stop_output();
+}
+
+static void obc_control_handle_line(const char *line)
+{
+	if (strcmp(line, "start") == 0) {
+		obs_queue_task(OBS_TASK_UI, obc_control_apply_start, NULL,
+			       false);
+	} else if (strcmp(line, "stop") == 0) {
+		obs_queue_task(OBS_TASK_UI, obc_control_apply_stop, NULL,
+			       false);
+	} else if (*line) {
+		blog(LOG_WARNING, "[obc-raw] control: ignoring '%s'", line);
+	}
+}
+
+/* The target the output would use, so the channel follows the same host:port
+ * the frames go to and its port + 1. */
+static void obc_control_target(char *out, size_t len)
+{
+	const char *env = getenv("OBC_RAW_TARGET");
+	if (env && *env) {
+		snprintf(out, len, "%s", env);
+		return;
+	}
+
+	obs_data_t *saved = obc_load_config();
+	const char *target = obs_data_get_string(saved, "target");
+	if (target && *target)
+		snprintf(out, len, "%s", target);
+	else
+		snprintf(out, len, "%s", OBC_DEFAULT_TARGET);
+	obs_data_release(saved);
+}
+
+/* A filtered port would otherwise hold this thread for the OS connect timeout,
+ * and OBS's exit waits on the join. */
+static obc_socket_t obc_control_dial(const char *host, const char *port)
+{
+	struct addrinfo hints;
+	struct addrinfo *res = NULL;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if (getaddrinfo(host, port, &hints, &res) != 0)
+		return OBC_NO_SOCKET;
+
+	obc_socket_t fd = socket(res->ai_family, res->ai_socktype,
+				 res->ai_protocol);
+	obc_socket_t ok = OBC_NO_SOCKET;
+
+	if (fd != OBC_NO_SOCKET) {
+		obc_set_nonblocking(fd, true);
+		if (connect(fd, res->ai_addr, res->ai_addrlen) == 0) {
+			ok = fd;
+		} else if (obc_in_progress()) {
+			int waited = 0;
+			while (waited < OBC_CONTROL_CONNECT_WAIT_MS &&
+			       !obc_control_stopping()) {
+				fd_set wfds;
+				struct timeval tv;
+				FD_ZERO(&wfds);
+				FD_SET(fd, &wfds);
+				tv.tv_sec = 0;
+				tv.tv_usec = 100 * 1000;
+				const int ready = select((int)fd + 1, NULL,
+							 &wfds, NULL, &tv);
+				if (ready > 0) {
+					int err = 0;
+#ifdef _WIN32
+					int elen = (int)sizeof(err);
+#else
+					socklen_t elen = sizeof(err);
+#endif
+					getsockopt(fd, SOL_SOCKET, SO_ERROR,
+						   (char *)&err, &elen);
+					if (err == 0)
+						ok = fd;
+					break;
+				}
+				if (ready < 0 && !obc_interrupted())
+					break;
+				waited += 100;
+			}
+		}
+	}
+	freeaddrinfo(res);
+
+	if (ok == OBC_NO_SOCKET) {
+		if (fd != OBC_NO_SOCKET)
+			obc_close_socket(fd);
+		return OBC_NO_SOCKET;
+	}
+
+	obc_set_nonblocking(ok, false);
+	obc_set_recv_timeout(ok, OBC_CONTROL_RECV_TIMEOUT_MS);
+	return ok;
+}
+
+static void *obc_control_main(void *arg)
+{
+	UNUSED_PARAMETER(arg);
+
+	char target[256];
+	obc_control_target(target, sizeof(target));
+
+	char host[256];
+	char port[32];
+	const char *colon = strrchr(target, ':');
+	if (!colon || (size_t)(colon - target) >= sizeof(host)) {
+		blog(LOG_WARNING,
+		     "[obc-raw] control: target '%s' must be host:port; the output has to be started manually",
+		     target);
+		return 0;
+	}
+	memcpy(host, target, (size_t)(colon - target));
+	host[colon - target] = '\0';
+	snprintf(port, sizeof(port), "%s", colon + 1);
+
+	const long frame_port = strtol(port, NULL, 10);
+	if (frame_port <= 0 || frame_port >= 65535) {
+		blog(LOG_WARNING,
+		     "[obc-raw] control: no port above '%s' to watch; the output has to be started manually",
+		     port);
+		return 0;
+	}
+	char control_port[16];
+	snprintf(control_port, sizeof(control_port), "%ld", frame_port + 1);
+
+	blog(LOG_INFO,
+	     "[obc-raw] control: following %s:%s for the encoder's start/stop",
+	     host, control_port);
+
+	char line[128];
+	size_t line_len = 0;
+
+	while (!obc_control_stopping()) {
+		obc_socket_t fd = obc_control_dial(host, control_port);
+		if (fd == OBC_NO_SOCKET) {
+			obc_control_pause(OBC_CONTROL_RETRY_MS);
+			continue;
+		}
+
+		blog(LOG_INFO, "[obc-raw] control: channel up");
+		line_len = 0;
+
+		for (;;) {
+			if (obc_control_stopping())
+				break;
+
+			char buf[64];
+			const int got = (int)recv(fd, buf, sizeof(buf), 0);
+			if (got == 0) {
+				blog(LOG_INFO,
+				     "[obc-raw] control: encoder closed the channel");
+				break;
+			}
+			if (got < 0) {
+				if (obc_interrupted() || obc_would_block())
+					continue;
+				blog(LOG_INFO,
+				     "[obc-raw] control: channel error %d",
+				     obc_socket_error());
+				break;
+			}
+
+			for (int i = 0; i < got; i++) {
+				const char c = buf[i];
+				if (c == '\n') {
+					line[line_len] = '\0';
+					obc_control_handle_line(line);
+					line_len = 0;
+					continue;
+				}
+				if (c == '\r')
+					continue;
+				if (line_len + 1 < sizeof(line))
+					line[line_len++] = c;
+				else
+					line_len = 0; /* runaway word: drop it */
+			}
+		}
+
+		obc_close_socket(fd);
+		obc_control_pause(OBC_CONTROL_RETRY_MS);
+	}
+
+	return 0;
+}
+
+/* CreateThread's entry point has a different signature, so the control loop is
+ * the same function on both platforms and only this shim differs. */
+#ifdef _WIN32
+static DWORD WINAPI obc_control_entry(LPVOID arg)
+{
+	obc_control_main(arg);
+	return 0;
+}
+#else
+#  define obc_control_entry obc_control_main
+#endif
+
+static void obc_control_start_thread(void)
+{
+	obc_mutex_lock(&obc_control_lock);
+	obc_control_stop = false;
+	obc_mutex_unlock(&obc_control_lock);
+
+	if (!obc_thread_start(&obc_control_thread, obc_control_entry, NULL)) {
+		blog(LOG_WARNING,
+		     "[obc-raw] control: no channel thread; the output has to be started manually");
+		return;
+	}
+	obc_control_thread_started = true;
+}
+
+static void obc_control_stop_thread(void)
+{
+	if (!obc_control_thread_started)
+		return;
+
+	obc_mutex_lock(&obc_control_lock);
+	obc_control_stop = true;
+	obc_mutex_unlock(&obc_control_lock);
+
+	obc_thread_join(obc_control_thread);
+	obc_control_thread_started = false;
 }
 
 /* The settings dialog is the only place these two values can be set: the
@@ -1055,6 +1431,9 @@ static void obc_frontend_event(enum obs_frontend_event event, void *private_data
 		 * The frontend announces its own teardown here, so remember it
 		 * and let obs_module_unload() skip the doomed remove. */
 		obc_frontend_exit_seen = true;
+		/* The control thread queues work onto the UI thread, which is
+		 * going away: stop it before that, not after. */
+		obc_control_stop_thread();
 		return;
 	}
 
@@ -1080,12 +1459,18 @@ bool obs_module_load(void)
 #endif
 	obs_register_output(&obc_output_info);
 	obc_menu_action = obc_menu_action_create(
-		"Open Broadcast raw output (start/stop)",
+		"Open Broadcast raw output (start/stop manually)",
 		obc_menu_action_toggled);
 	obs_frontend_add_tools_menu_item(
 		"Open Broadcast raw output (settings...)", obc_menu_settings,
 		NULL);
 	obs_frontend_add_event_callback(obc_frontend_event, NULL);
+
+	/* The encoder starts and stops this output; the Tools items remain the
+	 * manual override for an encoder that is not running the channel. */
+	obc_mutex_init(&obc_control_lock);
+	obc_control_start_thread();
+
 	blog(LOG_INFO,
 	     "[obc-raw] loaded: uncompressed frame output registered as 'obc_raw_output'");
 	return true;
@@ -1093,6 +1478,11 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	/* Before the output goes: the thread only queues UI work, but it must
+	 * not outlive the frontend it queues into. */
+	obc_control_stop_thread();
+	obc_mutex_destroy(&obc_control_lock);
+
 	/* libobs unloads modules after the frontend has been shut down, so on a
 	 * normal exit OBS_FRONTEND_EVENT_EXIT has already fired and the
 	 * frontend callbacks are gone; removing ours then would only log

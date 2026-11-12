@@ -72,6 +72,33 @@ so the change takes effect immediately.
 > The send-audio setting's JSON key is **`audio`**, not `send_audio`; the environment override is
 > **`OBC_RAW_AUDIO`**. Audio is **opt-out** — on by default.
 
+## Starting and stopping: the encoder drives it
+
+The output follows the encoder. The encoder opens a control port beside its frame listener — **frame
+port + 1**, so a target of `127.0.0.1:9300` pairs with a control port of `9301` — and writes one word per
+line:
+
+| Line | Meaning |
+|---|---|
+| `start` | The encoder is previewing or encoding: frames are wanted. |
+| `stop` | That ended: stop sending. |
+
+The channel is **state, not events**. A plugin that connects late — OBS started after the encoder, or
+restarted mid-session — is told the current state on accept, so OBS resumes into a running encoder
+without a click. Start is idempotent: `start` while already running changes nothing.
+
+Behaviour that matters operationally:
+
+- **A lost channel is not a stop.** The encoder restarts routinely, so the plugin keeps its output and
+  re-dials the channel every second; the frame socket has its own reconnect. Only an explicit `stop`
+  stops the output.
+- **The Tools items stay the manual override.** Starting from the menu still works when the encoder is
+  not running the channel, and `OBC_RAW_AUTOSTART` still starts the output at load for automated runs.
+  The menu check state follows the output itself, not the click.
+- **The channel never touches the output directly.** Both transitions are queued onto the OBS UI thread
+  with `obs_queue_task(OBS_TASK_UI, …)`, which is where every other start/stop in this plugin runs, and
+  the thread is joined at `OBS_FRONTEND_EVENT_EXIT` so nothing is queued into a dead UI.
+
 ## Defaults
 
 | Setting | Default | Notes |
@@ -225,10 +252,11 @@ OBC_RAW_AUTOSTART=1 OBC_RAW_TARGET=127.0.0.1:9300 obs --disable-shutdown-check
 - **The plugin is the TCP client; the receiver must be listening first.** If `connect()` fails, the output
   does not start (it logs the reason and refuses).
 - **One connection, one consumer.** The output writes to a single socket; there is no fan-out.
-- **No reconnection inside the plugin.** When the peer goes away the send fails repeatedly; after
-  ~90 consecutive failures (~1.5 s at 60 fps) the output calls
-  `obs_output_signal_stop(..., OBS_OUTPUT_DISCONNECTED)` and lets libobs retry (it does so every 2 s), so an
-  encoder restart reconnects on its own.
+- **Reconnection is the plugin's own.** When sends fail for `OBC_MAX_CONSECUTIVE_FAILURES` (90) consecutive
+  frames the socket is closed and marked disconnected, and the next video callback re-dials at most once a
+  second — the output itself stays running, so an encoder restart costs a second of frames rather than the
+  operator's stream. A re-dial replays the stream header, because the encoder reads exactly one per
+  connection.
 - **`linesize` in the header is always 0** by design; receivers must use `plane_bytes`.
 - **Audio is planar float32**, not interleaved — GStreamer `appsrc` consumers must interleave.
 - **v2 only.** v1 (video-only, 16-byte frame header) is not accepted.
@@ -237,8 +265,8 @@ OBC_RAW_AUTOSTART=1 OBC_RAW_TARGET=127.0.0.1:9300 obs --disable-shutdown-check
 - **Video formats:** I420, NV12, P010, YUY2, UYVY, BGRA/BGRX/RGBA/BGR3 have geometry; an unsupported OBS
   output format makes `start` fail loudly rather than guess. NVIDIA/P010 has no H.264 path on the encoder
   side, but that is the encoder's concern.
-- The output is registered with **no service**, so it never appears in OBS Settings → Output; it is started
-  from the Tools menu or via `OBC_RAW_AUTOSTART`.
+- The output is registered with **no service**, so it never appears in OBS Settings → Output: the encoder
+  starts and stops it over the control channel, and the Tools menu is the manual override.
 
 ## Gotchas found by running it for real
 
