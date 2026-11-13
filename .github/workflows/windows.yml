@@ -198,6 +198,16 @@ jobs:
           $sha = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
           "$sha  $zip" | Out-File -Encoding ascii -NoNewline "$zip.sha256"
 
+          # The website links /releases/latest/download/<stable name>, which only
+          # survives a version bump if the asset name carries no version. A
+          # release is immutable and GitHub has no asset symlink, so the same
+          # bytes ship under both names: the tag-named zip for the archive a
+          # support thread quotes, this one for the download page.
+          $stable = 'open-broadcast-raw-output-windows-x64.zip'
+          Copy-Item $zip $stable
+          $stableSha = (Get-FileHash -Algorithm SHA256 -Path $stable).Hash.ToLower()
+          "$stableSha  $stable" | Out-File -Encoding ascii -NoNewline "$stable.sha256"
+
           $size = (Get-Item $zip).Length
           $entries = (Get-ChildItem -Path $package -Recurse -File | ForEach-Object {
             $_.FullName.Substring($package.Length + 1) -replace '\\', '/'
@@ -212,6 +222,8 @@ jobs:
           path: |
             open-broadcast-raw-output-*-win64.zip
             open-broadcast-raw-output-*-win64.zip.sha256
+            open-broadcast-raw-output-windows-x64.zip
+            open-broadcast-raw-output-windows-x64.zip.sha256
             build/open-broadcast-raw-output.dll
 
       # Releases exist for tags only: a branch run publishes nothing, so the
@@ -220,9 +232,15 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          # Globs, so the stable names ride along with the tag-named ones —
+          # `*-win64.zip` does not match `*-windows-x64.zip`, and a release that
+          # silently uploaded only one of them is exactly how the encoder's first
+          # Windows download ended up 404.
           files: |
-            ${{ steps.package.outputs.zip }}
-            ${{ steps.package.outputs.zip }}.sha256
+            open-broadcast-raw-output-*-win64.zip
+            open-broadcast-raw-output-*-win64.zip.sha256
+            open-broadcast-raw-output-windows-x64.zip
+            open-broadcast-raw-output-windows-x64.zip.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
 

@@ -21,6 +21,29 @@ carrying OBS's own timestamps. With no service set, nothing else has to be confi
 No encoding, no muxing, no container. At 1080p60 NV12 a frame is **3,110,400 bytes** (1920×1080×1.5), i.e.
 ~**1493 Mbit/s** on the wire — this is a LAN/loopback transport, not a WAN one.
 
+## Download
+
+A prebuilt Windows package is published with every release — no compiler, no OBS SDK:
+
+| Platform | File |
+|---|---|
+| Windows 10/11 64-bit | `open-broadcast-raw-output-windows-x64.zip` |
+
+- Latest release: <https://github.com/patcarter883/obs-raw-output/releases/latest>
+- Download page: <https://stream.huntervalleyit.net.au/download>
+
+The zip is laid out as OBS expects, so extract it into the OBS install directory
+(`C:\Program Files\obs-studio\`), which puts the module at
+`obs-plugins\64bit\open-broadcast-raw-output.dll`. OBS scans that tree on start;
+the output then appears under **Settings → Output** as an open-broadcast output.
+Verify the published `.sha256` before extracting: the build is not code-signed.
+
+**A plugin loads only into the OBS that built it.** The release states the OBS
+version it targets, and an OBS upgrade can invalidate it — if OBS stops loading
+the module after an update, rebuild from source against the new headers (below).
+Only Windows ships a binary: on Linux the module is built against your distro's
+OBS, and there is no macOS build.
+
 ## Build and install
 
 Requires the libobs and obs-frontend-api dev headers (`pkg-config libobs obs-frontend-api`) plus Qt6 Widgets.
